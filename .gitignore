@@ -6,3 +6,5 @@ __pycache__/
 *.pyc
 .venv312
 .venv
+models/*.onnx
+models/**.onnx
