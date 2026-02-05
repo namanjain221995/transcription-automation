@@ -1,5 +1,0 @@
-{
-  "score": 62,
-  "verdict": "FAIL",
-  "reasoning": "focus_on_camera_pct is 62.19% (weak: 50\u201364). face_detected_pct is 100.0%, so no penalty applied. Final score 62 is below the 70 PASS threshold."
-}
