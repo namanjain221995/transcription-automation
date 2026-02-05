@@ -1,0 +1,8 @@
+﻿token*.json
+credentials*.json
+.openai_file_cache.json
+.vscode/
+__pycache__/
+*.pyc
+.venv312
+.venv
