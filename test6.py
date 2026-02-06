@@ -124,17 +124,14 @@ CREDENTIALS_FILE = Path("credentials.json")
 TOKEN_FILE = Path("token.json")
 FOLDER_MIME = "application/vnd.google-apps.folder"
 
-ROOT_2026_FOLDER_NAME = "2026"
+ROOT_2026_FOLDER_NAME = "2025"
 
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}
 
 # Which deliverable folders to process
 FOLDER_NAMES_TO_PROCESS = [
     "3. Introduction Video",
-    "4. Mock Interview (First Call)",
     "5. Project Scenarios",
-    "6. 30 Questions Related to Their Niche",
-    "7. 50 Questions Related to the Resume",
     "8. Tools & Technology Videos",
 ]
 

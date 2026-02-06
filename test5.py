@@ -45,10 +45,10 @@ CREDENTIALS_FILE = Path("credentials.json")
 TOKEN_FILE = Path("token.json")
 
 # SOURCE: read slots + people from here
-ROOT_2026_FOLDER_NAME = "2026"
+ROOT_2026_FOLDER_NAME = "2025"
 
 # DESTINATION: must exist anywhere in Drive. Script will NOT create it.
-OUTPUT_ROOT_FOLDER_NAME = "Candidate Result"
+OUTPUT_ROOT_FOLDER_NAME = "Candidate Result2"
 
 FOLDER_MIME = "application/vnd.google-apps.folder"
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -56,10 +56,7 @@ XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 # Deliverable folders (NO "1. Format")
 FOLDER_NAMES = [
     "3. Introduction Video",
-    "4. Mock Interview (First Call)",
     "5. Project Scenarios",
-    "6. 30 Questions Related to Their Niche",
-    "7. 50 Questions Related to the Resume",
     "8. Tools & Technology Videos",
 ]
 

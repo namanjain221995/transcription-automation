@@ -45,17 +45,14 @@ TOKEN_FILE = Path("token.json")
 FOLDER_MIME = "application/vnd.google-apps.folder"
 GOOGLE_DOC_MIME = "application/vnd.google-apps.document"
 
-ROOT_2026_FOLDER_NAME = "2026"  # can be nested anywhere in My Drive
+ROOT_2026_FOLDER_NAME = "2025"  # can be nested anywhere in My Drive
 
 # ============================================================
 # CONFIG (Prompts)
 # ============================================================
 FOLDER_TO_PROMPT = {
     "3. Introduction Video": "intro-prompt.txt",
-    "4. Mock Interview (First Call)": "mock-prompt.txt",
     "5. Project Scenarios": "project-scenario.txt",
-    "6. 30 Questions Related to Their Niche": "niche-prompt.txt",
-    "7. 50 Questions Related to the Resume": "CV-prompt.txt",
     "8. Tools & Technology Videos": "Tools-Technology-prompt.txt",
 }
 

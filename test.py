@@ -28,16 +28,13 @@ load_dotenv()
 # =========================
 # CONFIG
 # =========================
-ROOT_2026_FOLDER_NAME = "2026"  # the folder containing Slot folders (can be nested anywhere in My Drive)
+ROOT_2026_FOLDER_NAME = "2025"  # the folder containing Slot folders (can be nested anywhere in My Drive)
 
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}
 
 FOLDER_NAMES_TO_PROCESS = [
     "3. Introduction Video",
-    "4. Mock Interview (First Call)",
     "5. Project Scenarios",
-    "6. 30 Questions Related to Their Niche",
-    "7. 50 Questions Related to the Resume",
     "8. Tools & Technology Videos",
 ]
 

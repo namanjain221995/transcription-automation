@@ -35,8 +35,8 @@ SCOPES = ["https://www.googleapis.com/auth/drive"]
 CREDENTIALS_FILE = Path("credentials.json")
 TOKEN_FILE = Path("token.json")
 
-ROOT_2026_FOLDER_NAME = "2026"
-OUTPUT_ROOT_FOLDER_NAME = "Candidate Result"
+ROOT_2026_FOLDER_NAME = "2025"
+OUTPUT_ROOT_FOLDER_NAME = "Candidate Result2"
 OUTPUT_XLSX_NAME = "Deliverables Analysis Sheet.xlsx"
 
 FOLDER_MIME = "application/vnd.google-apps.folder"

@@ -34,10 +34,10 @@ CREDENTIALS_FILE = Path("credentials.json")
 TOKEN_FILE = Path("token.json")
 
 # SOURCE: contains slot folders (read from here)
-ROOT_2026_FOLDER_NAME = "2026"
+ROOT_2026_FOLDER_NAME = "2025"
 
 # DESTINATION: must exist anywhere in Drive. Script will NOT create it.
-OUTPUT_ROOT_FOLDER_NAME = "Candidate Result"
+OUTPUT_ROOT_FOLDER_NAME = "Candidate Result2"
 
 FOLDER_MIME = "application/vnd.google-apps.folder"
 GDOC_MIME = "application/vnd.google-apps.document"
