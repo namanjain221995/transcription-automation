@@ -1,0 +1,51 @@
+name: Deploy to EC2 and Run Pipeline
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch: {}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Deploy & Run on EC2 via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: 22
+          script_stop: true
+          command_timeout: 120m
+          script: |
+            set -euo pipefail
+
+            echo "== Server info =="
+            whoami
+            pwd
+            date
+
+            echo "== Go to project =="
+            cd "${{ secrets.EC2_PATH }}"
+
+            echo "== Pull latest code =="
+            git fetch --all
+            git reset --hard origin/main
+
+            echo "== Docker sanity =="
+            docker --version
+            docker compose version
+
+            echo "== Build and run pipeline (exit with status) =="
+            docker compose down --remove-orphans || true
+            docker compose up --build --abort-on-container-exit --exit-code-from test_runner
+
+            echo "== Cleanup =="
+            docker compose down --remove-orphans || true
+
+            echo "== DONE =="
