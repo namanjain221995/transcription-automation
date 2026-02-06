@@ -12,6 +12,8 @@ jobs:
     steps:
       - name: Deploy and run on EC2
         uses: appleboy/ssh-action@v1.0.3
+        env:
+          EC2_PATH: ${{ secrets.EC2_PATH }}
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
@@ -19,6 +21,7 @@ jobs:
           port: 22
           script_stop: true
           command_timeout: 120m
+          envs: EC2_PATH
           script: |
             set -euo pipefail
 
@@ -28,21 +31,15 @@ jobs:
             date
 
             echo "== Validate EC2_PATH =="
-            if [ -z "${{ secrets.EC2_PATH }}" ]; then
+            if [ -z "$EC2_PATH" ]; then
               echo "ERROR: EC2_PATH secret is missing/empty"
               exit 1
             fi
 
             echo "== Go to project =="
-            cd "${{ secrets.EC2_PATH }}"
+            cd "$EC2_PATH"
             pwd
             ls -la
-
-            echo "== Ensure git is installed =="
-            if ! command -v git >/dev/null 2>&1; then
-              echo "git not found. Installing..."
-              sudo yum install -y git || sudo dnf install -y git
-            fi
 
             echo "== Pull latest code =="
             git fetch --all
@@ -50,22 +47,13 @@ jobs:
 
             echo "== Docker sanity =="
             docker --version
+            docker compose version
 
-            echo "== Ensure docker-compose exists =="
-            if ! command -v docker-compose >/dev/null 2>&1; then
-              echo "docker-compose not found. Installing..."
-              sudo curl -L "https://github.com/docker/compose/releases/download/v2.27.0/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-              sudo chmod +x /usr/local/bin/docker-compose
-              docker-compose --version
-            else
-              docker-compose --version
-            fi
-
-            echo "== Run pipeline using docker-compose =="
-            docker-compose down --remove-orphans || true
-            docker-compose up --build --abort-on-container-exit --exit-code-from test_runner
+            echo "== Run pipeline using docker compose =="
+            docker compose down || true
+            docker compose up --build --abort-on-container-exit --exit-code-from test_runner
 
             echo "== Cleanup =="
-            docker-compose down --remove-orphans || true
+            docker compose down || true
 
             echo "== DONE =="
