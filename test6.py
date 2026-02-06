@@ -4,27 +4,27 @@ Drive-integrated Candidate Eye/Face Tracking (slot-based)
 + Flexible candidate LEFT/RIGHT view (split-screen or single)
 
 NON-INTERACTIVE UPDATE (Option B):
-✅ If SLOT_CHOICE is set (e.g., SLOT_CHOICE=2), script auto-picks that slot.
+If SLOT_CHOICE is set (e.g., SLOT_CHOICE=2), script auto-picks that slot.
    If not set, it shows interactive slot menu.
 
 STRICT REF MATCH BEHAVIOR:
-✅ If REF_SIM is '-' (no match) OR REF_SIM < ref_min_sim, treat as TRAINER:
+If REF_SIM is '-' (no match) OR REF_SIM < ref_min_sim, treat as TRAINER:
    - Do NOT track / do NOT compute gaze / do NOT run FaceMesh / do NOT draw mesh for that frame.
    - Only track when matched candidate is found (REF_SIM >= ref_min_sim).
    - If no reference image exists, fallback logic still applies (candidate_side/largest-face).
 
-✅ Do NOT upload these to Drive:
+Do NOT upload these to Drive:
    - __EYE_summary.json
    - __EYE_metrics.csv
 
-✅ Do NOT re-process generated outputs (any file containing '__EYE_').
+Do NOT re-process generated outputs (any file containing '__EYE_').
 
 We still upload:
 - __EYE_result.json
 - annotated video (if enabled)
 
 Retry behavior:
-✅ If a video fails (e.g., BrokenPipeError), retry the SAME video again (not exit)
+If a video fails (e.g., BrokenPipeError), retry the SAME video again (not exit)
    up to MAX_VIDEO_RETRIES (env) with backoff.
 
 Install:
