@@ -1,16 +1,36 @@
-name: Deploy & Run on EC2 via SSH
+name: Start EC2 -> Run Docker Compose -> Stop EC2
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
 
     steps:
-      - name: Deploy and run on EC2
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Start EC2 instance (if stopped)
+        run: |
+          set -e
+          INSTANCE_ID="${{ secrets.EC2_INSTANCE_ID }}"
+          aws ec2 start-instances --instance-ids "$INSTANCE_ID" >/dev/null || true
+          echo "Waiting for instance to be running..."
+          aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
+          echo "EC2 is running."
+
+      - name: Deploy and run on EC2 via SSH (docker-compose)
         uses: appleboy/ssh-action@v1.0.3
         env:
           EC2_PATH: ${{ secrets.EC2_PATH }}
@@ -20,7 +40,7 @@ jobs:
           key: ${{ secrets.EC2_SSH_KEY }}
           port: 22
           script_stop: true
-          command_timeout: 120m
+          command_timeout: 300m
           envs: EC2_PATH
           script: |
             set -euo pipefail
@@ -31,7 +51,7 @@ jobs:
             date
 
             echo "== Validate EC2_PATH =="
-            if [ -z "$EC2_PATH" ]; then
+            if [ -z "${EC2_PATH:-}" ]; then
               echo "ERROR: EC2_PATH secret is missing/empty"
               exit 1
             fi
@@ -41,15 +61,33 @@ jobs:
             pwd
             ls -la
 
+            echo "== Ensure git installed =="
+            if ! command -v git >/dev/null 2>&1; then
+              sudo yum install -y git || sudo dnf install -y git
+            fi
+
             echo "== Pull latest code =="
             git fetch --all
             git reset --hard origin/main
 
-            echo "== Docker sanity =="
-            docker --version
-            docker-compose version
+            echo "== Ensure docker running =="
+            sudo systemctl enable docker || true
+            sudo systemctl start docker || true
 
-            echo "== Run pipeline using docker compose =="
+            echo "== Ensure docker-compose installed =="
+            if ! command -v docker-compose >/dev/null 2>&1; then
+              sudo curl -L "https://github.com/docker/compose/releases/download/v2.27.0/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+              sudo chmod +x /usr/local/bin/docker-compose
+            fi
+            docker-compose --version
+
+            echo "== Ensure buildx exists (for compose build) =="
+            if ! docker buildx version >/dev/null 2>&1; then
+              sudo yum install -y docker-buildx || sudo dnf install -y docker-buildx
+            fi
+            docker buildx version
+
+            echo "== Run pipeline =="
             docker-compose down || true
             docker-compose up --build --abort-on-container-exit --exit-code-from test_runner
 
@@ -57,3 +95,14 @@ jobs:
             docker-compose down || true
 
             echo "== DONE =="
+
+      - name: Stop EC2 instance (always)
+        if: always()
+        run: |
+          set -e
+          INSTANCE_ID="${{ secrets.EC2_INSTANCE_ID }}"
+          echo "Stopping EC2 instance (not terminating)..."
+          aws ec2 stop-instances --instance-ids "$INSTANCE_ID" >/dev/null || true
+          echo "Waiting for instance to stop..."
+          aws ec2 wait instance-stopped --instance-ids "$INSTANCE_ID"
+          echo "EC2 stopped."
