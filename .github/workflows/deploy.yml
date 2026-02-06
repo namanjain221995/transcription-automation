@@ -18,58 +18,61 @@ jobs:
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}   # arn:aws:iam::127358876344:role/github-ec2-role
+          aws-region: ${{ secrets.AWS_REGION }}         # us-east-1
 
       - name: Start EC2 instance (if stopped)
-        id: start
         run: |
-          set -euo pipefail
+          set -e
           INSTANCE_ID="${{ secrets.EC2_INSTANCE_ID }}"
-
           aws ec2 start-instances --instance-ids "$INSTANCE_ID" >/dev/null || true
           echo "Waiting for instance to be running..."
           aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
+          echo "EC2 is running."
 
-          echo "Fetching public IP..."
-          PUBLIC_IP="$(aws ec2 describe-instances \
+      - name: Get EC2 Public IP (after start)
+        id: ec2ip
+        run: |
+          set -e
+          INSTANCE_ID="${{ secrets.EC2_INSTANCE_ID }}"
+          IP="$(aws ec2 describe-instances \
             --instance-ids "$INSTANCE_ID" \
-            --query "Reservations[0].Instances[0].PublicIpAddress" \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' \
             --output text)"
-
-          if [ -z "$PUBLIC_IP" ] || [ "$PUBLIC_IP" = "None" ]; then
-            echo "ERROR: Instance has no Public IP. Enable auto-assign public IPv4 OR attach Elastic IP."
+          if [ "$IP" = "None" ] || [ -z "$IP" ]; then
+            echo "ERROR: Could not get Public IP for instance $INSTANCE_ID"
             exit 1
           fi
+          echo "public_ip=$IP" >> "$GITHUB_OUTPUT"
+          echo "EC2 Public IP: $IP"
 
-          echo "PUBLIC_IP=$PUBLIC_IP" >> "$GITHUB_ENV"
-          echo "EC2 is running at $PUBLIC_IP"
-
-      - name: Wait for SSH port 22 to be ready
+      - name: Wait for SSH (port 22) to be ready
         run: |
-          set -euo pipefail
-          echo "Waiting for SSH to be reachable on $PUBLIC_IP:22 ..."
+          set -e
+          HOST="${{ steps.ec2ip.outputs.public_ip }}"
+          echo "Waiting for SSH on $HOST:22 ..."
           for i in {1..60}; do
-            if nc -z -w 2 "$PUBLIC_IP" 22; then
+            if nc -z -w 5 "$HOST" 22; then
               echo "SSH is reachable."
               exit 0
             fi
+            echo "Still waiting ($i/60)..."
             sleep 5
           done
-          echo "ERROR: SSH not reachable on port 22. Check security group / subnet / NACL."
+          echo "ERROR: SSH not reachable after waiting."
           exit 1
 
-      - name: Deploy and run on EC2 via SSH (docker-compose)
+      - name: Deploy and run on EC2 via SSH (docker compose)
         uses: appleboy/ssh-action@v1.0.3
         env:
-          EC2_PATH: ${{ secrets.EC2_PATH }}
+          EC2_PATH: ${{ secrets.EC2_PATH }}   # /home/ec2-user/transcription-automation
         with:
-          host: ${{ env.PUBLIC_IP }}
-          username: ${{ secrets.EC2_USER }}
+          host: ${{ steps.ec2ip.outputs.public_ip }}
+          username: ${{ secrets.EC2_USER }}   # ec2-user
           key: ${{ secrets.EC2_SSH_KEY }}
           port: 22
           script_stop: true
-          command_timeout: 300m
+          command_timeout: 330m
           envs: EC2_PATH
           script: |
             set -euo pipefail
@@ -80,8 +83,13 @@ jobs:
             date
 
             echo "== Validate EC2_PATH =="
+            echo "EC2_PATH='$EC2_PATH'"
             if [ -z "${EC2_PATH:-}" ]; then
               echo "ERROR: EC2_PATH is missing/empty"
+              exit 1
+            fi
+            if [ ! -d "$EC2_PATH" ]; then
+              echo "ERROR: EC2_PATH does not exist on server: $EC2_PATH"
               exit 1
             fi
 
@@ -102,12 +110,15 @@ jobs:
             echo "== Ensure docker running =="
             sudo systemctl enable docker || true
             sudo systemctl start docker || true
+            docker --version
 
-            echo "== Ensure docker compose plugin exists =="
+            echo "== Pick compose command =="
             if docker compose version >/dev/null 2>&1; then
               COMPOSE="docker compose"
+            elif command -v docker-compose >/dev/null 2>&1; then
+              COMPOSE="docker-compose"
             else
-              echo "docker compose plugin not found, installing docker-compose v2 binary..."
+              echo "docker compose not found. Installing docker-compose v2 binary..."
               sudo curl -L "https://github.com/docker/compose/releases/download/v2.27.0/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
               sudo chmod +x /usr/local/bin/docker-compose
               COMPOSE="docker-compose"
@@ -126,7 +137,7 @@ jobs:
       - name: Stop EC2 instance (always)
         if: always()
         run: |
-          set -euo pipefail
+          set -e
           INSTANCE_ID="${{ secrets.EC2_INSTANCE_ID }}"
           echo "Stopping EC2 instance (not terminating)..."
           aws ec2 stop-instances --instance-ids "$INSTANCE_ID" >/dev/null || true
