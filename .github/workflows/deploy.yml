@@ -47,13 +47,13 @@ jobs:
 
             echo "== Docker sanity =="
             docker --version
-            docker compose version
+            docker-compose version
 
             echo "== Run pipeline using docker compose =="
-            docker compose down || true
-            docker compose up --build --abort-on-container-exit --exit-code-from test_runner
+            docker-compose down || true
+            docker-compose up --build --abort-on-container-exit --exit-code-from test_runner
 
             echo "== Cleanup =="
-            docker compose down || true
+            docker-compose down || true
 
             echo "== DONE =="
