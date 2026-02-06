@@ -22,20 +22,49 @@ jobs:
           aws-region: ${{ secrets.AWS_REGION }}
 
       - name: Start EC2 instance (if stopped)
+        id: start
         run: |
-          set -e
+          set -euo pipefail
           INSTANCE_ID="${{ secrets.EC2_INSTANCE_ID }}"
+
           aws ec2 start-instances --instance-ids "$INSTANCE_ID" >/dev/null || true
           echo "Waiting for instance to be running..."
           aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
-          echo "EC2 is running."
+
+          echo "Fetching public IP..."
+          PUBLIC_IP="$(aws ec2 describe-instances \
+            --instance-ids "$INSTANCE_ID" \
+            --query "Reservations[0].Instances[0].PublicIpAddress" \
+            --output text)"
+
+          if [ -z "$PUBLIC_IP" ] || [ "$PUBLIC_IP" = "None" ]; then
+            echo "ERROR: Instance has no Public IP. Enable auto-assign public IPv4 OR attach Elastic IP."
+            exit 1
+          fi
+
+          echo "PUBLIC_IP=$PUBLIC_IP" >> "$GITHUB_ENV"
+          echo "EC2 is running at $PUBLIC_IP"
+
+      - name: Wait for SSH port 22 to be ready
+        run: |
+          set -euo pipefail
+          echo "Waiting for SSH to be reachable on $PUBLIC_IP:22 ..."
+          for i in {1..60}; do
+            if nc -z -w 2 "$PUBLIC_IP" 22; then
+              echo "SSH is reachable."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "ERROR: SSH not reachable on port 22. Check security group / subnet / NACL."
+          exit 1
 
       - name: Deploy and run on EC2 via SSH (docker-compose)
         uses: appleboy/ssh-action@v1.0.3
         env:
           EC2_PATH: ${{ secrets.EC2_PATH }}
         with:
-          host: ${{ secrets.EC2_HOST }}
+          host: ${{ env.PUBLIC_IP }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
           port: 22
@@ -52,7 +81,7 @@ jobs:
 
             echo "== Validate EC2_PATH =="
             if [ -z "${EC2_PATH:-}" ]; then
-              echo "ERROR: EC2_PATH secret is missing/empty"
+              echo "ERROR: EC2_PATH is missing/empty"
               exit 1
             fi
 
@@ -74,32 +103,30 @@ jobs:
             sudo systemctl enable docker || true
             sudo systemctl start docker || true
 
-            echo "== Ensure docker-compose installed =="
-            if ! command -v docker-compose >/dev/null 2>&1; then
+            echo "== Ensure docker compose plugin exists =="
+            if docker compose version >/dev/null 2>&1; then
+              COMPOSE="docker compose"
+            else
+              echo "docker compose plugin not found, installing docker-compose v2 binary..."
               sudo curl -L "https://github.com/docker/compose/releases/download/v2.27.0/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
               sudo chmod +x /usr/local/bin/docker-compose
+              COMPOSE="docker-compose"
             fi
-            docker-compose --version
-
-            echo "== Ensure buildx exists (for compose build) =="
-            if ! docker buildx version >/dev/null 2>&1; then
-              sudo yum install -y docker-buildx || sudo dnf install -y docker-buildx
-            fi
-            docker buildx version
+            $COMPOSE version
 
             echo "== Run pipeline =="
-            docker-compose down || true
-            docker-compose up --build --abort-on-container-exit --exit-code-from test_runner
+            $COMPOSE down || true
+            $COMPOSE up --build --abort-on-container-exit --exit-code-from test_runner
 
             echo "== Cleanup =="
-            docker-compose down || true
+            $COMPOSE down || true
 
             echo "== DONE =="
 
       - name: Stop EC2 instance (always)
         if: always()
         run: |
-          set -e
+          set -euo pipefail
           INSTANCE_ID="${{ secrets.EC2_INSTANCE_ID }}"
           echo "Stopping EC2 instance (not terminating)..."
           aws ec2 stop-instances --instance-ids "$INSTANCE_ID" >/dev/null || true
