@@ -2,7 +2,7 @@ name: Deploy & Run on EC2 via SSH
 
 on:
   push:
-    branches: ["main"]
+    branches: [ "main" ]
   workflow_dispatch:
 
 jobs:
@@ -16,9 +16,9 @@ jobs:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
-          port: ${{ secrets.EC2_PORT || 22 }}
+          port: 22
           script_stop: true
-          command_timeout: 60m
+          command_timeout: 120m
           script: |
             set -euo pipefail
 
@@ -35,7 +35,7 @@ jobs:
 
             echo "== Go to project =="
             cd "${{ secrets.EC2_PATH }}"
-            echo "PWD=$(pwd)"
+            pwd
             ls -la
 
             echo "== Ensure git is installed =="
@@ -50,16 +50,22 @@ jobs:
 
             echo "== Docker sanity =="
             docker --version
-            docker compose version || docker-compose --version
 
-            echo "== Run pipeline using docker compose =="
-            # Stop old containers (if any)
-            docker compose down --remove-orphans || true
+            echo "== Ensure docker-compose exists =="
+            if ! command -v docker-compose >/dev/null 2>&1; then
+              echo "docker-compose not found. Installing..."
+              sudo curl -L "https://github.com/docker/compose/releases/download/v2.27.0/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+              sudo chmod +x /usr/local/bin/docker-compose
+              docker-compose --version
+            else
+              docker-compose --version
+            fi
 
-            # Build + run, exit with test_runner code
-            docker compose up --build --abort-on-container-exit --exit-code-from test_runner
+            echo "== Run pipeline using docker-compose =="
+            docker-compose down --remove-orphans || true
+            docker-compose up --build --abort-on-container-exit --exit-code-from test_runner
 
             echo "== Cleanup =="
-            docker compose down --remove-orphans || true
+            docker-compose down --remove-orphans || true
 
             echo "== DONE =="
