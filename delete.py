@@ -21,7 +21,7 @@ USE_SHARED_DRIVES = False
 
 # Output root folder for ONLY test4 + test5
 OUTPUT_ROOT_FOLDER_NAME = "Candidate Result"
-# If you want to hardcode the ID for safety (recommended), set it here
+# If you want to hardcode the ID for safety (recommended), set it here:
 OUTPUT_ROOT_FOLDER_ID = None  # e.g. "1AbCdefGhIJK..."
 
 FOLDER_MIME = "application/vnd.google-apps.folder"
