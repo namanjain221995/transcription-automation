@@ -68,47 +68,7 @@ jobs:
           echo "ERROR: SSH not reachable."
           exit 1
 
-      - name: Check if run is DONE and create tarball on EC2 (if done)
-        id: make_tar
-        uses: appleboy/ssh-action@v1.0.3
-        env:
-          EC2_PATH: ${{ secrets.EC2_PATH }}
-        with:
-          host: ${{ steps.ec2ip.outputs.public_ip }}
-          username: ${{ secrets.EC2_USER }}
-          key: ${{ secrets.EC2_SSH_KEY }}
-          port: 22
-          script_stop: true
-          command_timeout: 15m
-          envs: EC2_PATH
-          script: |
-            set -euo pipefail
-            cd "$EC2_PATH"
-
-            if [ ! -f LAST_RUN_ID ]; then
-              echo "NO LAST_RUN_ID. Not finished."
-              exit 0
-            fi
-
-            RUN_ID="$(cat LAST_RUN_ID)"
-            RUN_DIR="$EC2_PATH/runs/$RUN_ID"
-            TAR="/tmp/run_${RUN_ID}.tgz"
-
-            if [ ! -d "$RUN_DIR" ]; then
-              echo "RUN_DIR missing: $RUN_DIR"
-              exit 0
-            fi
-
-            # done condition: exit_code.txt exists
-            if [ -f "$RUN_DIR/exit_code.txt" ]; then
-              echo "DONE. Creating tarball: $TAR"
-              tar -czf "$TAR" -C "$EC2_PATH" "runs/$RUN_ID" "LAST_RUN_ID"
-              ls -la "$TAR"
-            else
-              echo "Not done yet (exit_code.txt missing)."
-            fi
-
-      - name: Determine done/not-done (fast SSH check)
+      - name: Determine done/not-done and get RUN_ID
         id: donecheck
         run: |
           set -euo pipefail
@@ -118,15 +78,26 @@ jobs:
           echo "${{ secrets.EC2_SSH_KEY }}" > "$KEY_FILE"
           chmod 600 "$KEY_FILE"
 
+          # If LAST_RUN_ID missing -> not done
+          if ! ssh -o StrictHostKeyChecking=no -i "$KEY_FILE" "$USER@$HOST" \
+              "cd '${{ secrets.EC2_PATH }}' && test -f LAST_RUN_ID"; then
+            echo "done=false" >> "$GITHUB_OUTPUT"
+            echo "No LAST_RUN_ID yet."
+            exit 0
+          fi
+
+          RUN_ID="$(ssh -o StrictHostKeyChecking=no -i "$KEY_FILE" "$USER@$HOST" \
+              "cd '${{ secrets.EC2_PATH }}' && cat LAST_RUN_ID")"
+
+          # Done condition: exit_code.txt exists
           if ssh -o StrictHostKeyChecking=no -i "$KEY_FILE" "$USER@$HOST" \
-              "cd '${{ secrets.EC2_PATH }}' && [ -f LAST_RUN_ID ] && RUN_ID=\$(cat LAST_RUN_ID) && [ -f \"runs/\$RUN_ID/exit_code.txt\" ]"; then
-            RUN_ID="$(ssh -o StrictHostKeyChecking=no -i "$KEY_FILE" "$USER@$HOST" "cd '${{ secrets.EC2_PATH }}' && cat LAST_RUN_ID")"
+              "cd '${{ secrets.EC2_PATH }}' && test -f 'runs/${RUN_ID}/exit_code.txt'"; then
             echo "done=true" >> "$GITHUB_OUTPUT"
             echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
             echo "Run is done. RUN_ID=$RUN_ID"
           else
             echo "done=false" >> "$GITHUB_OUTPUT"
-            echo "Run not finished yet."
+            echo "Run not finished yet. RUN_ID=$RUN_ID"
           fi
 
       - name: Exit if still running
@@ -135,8 +106,7 @@ jobs:
           echo "Still running. Next schedule will check again."
           exit 0
 
-      - name: Download tarball via SCP
-        id: download
+      - name: Create tarball on EC2 (runs/<RUN_ID> + LAST_RUN_ID)
         if: steps.donecheck.outputs.done == 'true'
         run: |
           set -euo pipefail
@@ -148,14 +118,30 @@ jobs:
           echo "${{ secrets.EC2_SSH_KEY }}" > "$KEY_FILE"
           chmod 600 "$KEY_FILE"
 
-          # Ensure tar exists (in case previous step didn't create it)
-          ssh -o StrictHostKeyChecking=no -i "$KEY_FILE" "$USER@$HOST" \
-            "cd '${{ secrets.EC2_PATH }}' && TAR=/tmp/run_${RUN_ID}.tgz && (test -f \$TAR || tar -czf \$TAR -C '${{ secrets.EC2_PATH }}' runs/${RUN_ID} LAST_RUN_ID) && ls -la \$TAR"
+          ssh -o StrictHostKeyChecking=no -i "$KEY_FILE" "$USER@$HOST" "
+            set -euo pipefail
+            cd '${{ secrets.EC2_PATH }}'
+            TAR=/tmp/run_${RUN_ID}.tgz
+            tar -czf \$TAR -C '${{ secrets.EC2_PATH }}' runs/${RUN_ID} LAST_RUN_ID
+            ls -la \$TAR
+          "
+
+      - name: Download tarball via SCP
+        if: steps.donecheck.outputs.done == 'true'
+        run: |
+          set -euo pipefail
+          HOST="${{ steps.ec2ip.outputs.public_ip }}"
+          USER="${{ secrets.EC2_USER }}"
+          RUN_ID="${{ steps.donecheck.outputs.run_id }}"
+
+          KEY_FILE="$(mktemp)"
+          echo "${{ secrets.EC2_SSH_KEY }}" > "$KEY_FILE"
+          chmod 600 "$KEY_FILE"
 
           scp -o StrictHostKeyChecking=no -i "$KEY_FILE" \
             "$USER@$HOST:/tmp/run_${RUN_ID}.tgz" "./run_${RUN_ID}.tgz"
 
-      - name: Upload GitHub artifact (logs/markers)
+      - name: Upload GitHub artifact
         if: steps.donecheck.outputs.done == 'true'
         uses: actions/upload-artifact@v4
         with:

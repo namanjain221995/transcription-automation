@@ -16,7 +16,7 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 600
+    timeout-minutes: 60
 
     steps:
       - name: Configure AWS credentials (OIDC)
@@ -68,10 +68,10 @@ jobs:
       - name: Deploy and start compose in background (detached)
         uses: appleboy/ssh-action@v1.0.3
         env:
-          EC2_PATH: ${{ secrets.EC2_PATH }} # /home/ec2-user/transcription-automation
+          EC2_PATH: ${{ secrets.EC2_PATH }}   # /home/ec2-user/transcription-automation
         with:
           host: ${{ steps.ec2ip.outputs.public_ip }}
-          username: ${{ secrets.EC2_USER }} # ec2-user
+          username: ${{ secrets.EC2_USER }}   # ec2-user
           key: ${{ secrets.EC2_SSH_KEY }}
           port: 22
           script_stop: true
@@ -135,6 +135,7 @@ jobs:
             echo "RUN_DIR=$RUN_DIR"
 
             echo "== Start compose (durable detached) =="
+            # IMPORTANT: use DOUBLE QUOTES so $RUN_DIR expands
             # setsid + nohup + </dev/null makes it survive SSH disconnects
             setsid nohup bash -lc "
               set +e
@@ -146,8 +147,8 @@ jobs:
               date > '$RUN_DIR/DONE'
               $COMPOSE down || true
               exit 0
-            " > '$RUN_DIR/run.log' 2>&1 < /dev/null &
+            " > "$RUN_DIR/run.log" 2>&1 < /dev/null &
 
-            echo \$! | tee '$RUN_DIR/pid.txt'
+            echo $! | tee "$RUN_DIR/pid.txt"
             echo "Detached PID=$(cat "$RUN_DIR/pid.txt")"
             echo "Log file: $RUN_DIR/run.log"
