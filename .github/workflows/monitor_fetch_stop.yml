@@ -1,16 +1,16 @@
-name: EC2 Monitor -> Fetch Artifacts -> Stop
+name: EC2 Monitor -> Stop Docker -> Stop EC2
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/15 * * * *"   # every 15 minutes
+    - cron: "*/15 * * * *"
 
 permissions:
   id-token: write
   contents: read
 
 jobs:
-  monitor_fetch_stop:
+  monitor_stop:
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -34,7 +34,7 @@ jobs:
       - name: Exit if instance not running
         if: steps.state.outputs.state != 'running'
         run: |
-          echo "Instance is not running. Nothing to fetch/stop."
+          echo "Instance is not running. Nothing to do."
           exit 0
 
       - name: Get EC2 Public IP
@@ -51,24 +51,19 @@ jobs:
             exit 1
           fi
           echo "public_ip=$IP" >> "$GITHUB_OUTPUT"
-          echo "EC2 Public IP: $IP"
 
       - name: Wait for SSH (port 22)
         run: |
           set -euo pipefail
           HOST="${{ steps.ec2ip.outputs.public_ip }}"
-          echo "Waiting for SSH on $HOST:22 ..."
           for i in {1..60}; do
-            if nc -z -w 5 "$HOST" 22; then
-              echo "SSH reachable."
-              exit 0
-            fi
+            if nc -z -w 5 "$HOST" 22; then exit 0; fi
             sleep 5
           done
           echo "ERROR: SSH not reachable."
           exit 1
 
-      - name: Determine done/not-done and get RUN_ID
+      - name: Check if run finished (exit_code.txt exists)
         id: donecheck
         run: |
           set -euo pipefail
@@ -78,88 +73,60 @@ jobs:
           echo "${{ secrets.EC2_SSH_KEY }}" > "$KEY_FILE"
           chmod 600 "$KEY_FILE"
 
-          # If LAST_RUN_ID missing -> not done
           if ! ssh -o StrictHostKeyChecking=no -i "$KEY_FILE" "$USER@$HOST" \
-              "cd '${{ secrets.EC2_PATH }}' && test -f LAST_RUN_ID"; then
+            "cd '${{ secrets.EC2_PATH }}' && test -f LAST_RUN_ID"; then
             echo "done=false" >> "$GITHUB_OUTPUT"
-            echo "No LAST_RUN_ID yet."
             exit 0
           fi
 
           RUN_ID="$(ssh -o StrictHostKeyChecking=no -i "$KEY_FILE" "$USER@$HOST" \
-              "cd '${{ secrets.EC2_PATH }}' && cat LAST_RUN_ID")"
+            "cd '${{ secrets.EC2_PATH }}' && cat LAST_RUN_ID")"
 
-          # Done condition: exit_code.txt exists
           if ssh -o StrictHostKeyChecking=no -i "$KEY_FILE" "$USER@$HOST" \
-              "cd '${{ secrets.EC2_PATH }}' && test -f 'runs/${RUN_ID}/exit_code.txt'"; then
+            "cd '${{ secrets.EC2_PATH }}' && test -f 'runs/${RUN_ID}/exit_code.txt'"; then
             echo "done=true" >> "$GITHUB_OUTPUT"
             echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
-            echo "Run is done. RUN_ID=$RUN_ID"
           else
             echo "done=false" >> "$GITHUB_OUTPUT"
-            echo "Run not finished yet. RUN_ID=$RUN_ID"
+            echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Exit if still running
         if: steps.donecheck.outputs.done != 'true'
         run: |
-          echo "Still running. Next schedule will check again."
+          echo "Run still running (RUN_ID=${{ steps.donecheck.outputs.run_id }})."
           exit 0
 
-      - name: Create tarball on EC2 (runs/<RUN_ID> + LAST_RUN_ID)
-        if: steps.donecheck.outputs.done == 'true'
-        run: |
-          set -euo pipefail
-          HOST="${{ steps.ec2ip.outputs.public_ip }}"
-          USER="${{ secrets.EC2_USER }}"
-          RUN_ID="${{ steps.donecheck.outputs.run_id }}"
-
-          KEY_FILE="$(mktemp)"
-          echo "${{ secrets.EC2_SSH_KEY }}" > "$KEY_FILE"
-          chmod 600 "$KEY_FILE"
-
-          ssh -o StrictHostKeyChecking=no -i "$KEY_FILE" "$USER@$HOST" "
-            set -euo pipefail
-            cd '${{ secrets.EC2_PATH }}'
-            TAR=/tmp/run_${RUN_ID}.tgz
-            tar -czf \$TAR -C '${{ secrets.EC2_PATH }}' runs/${RUN_ID} LAST_RUN_ID
-            ls -la \$TAR
-          "
-
-      - name: Download tarball via SCP
-        if: steps.donecheck.outputs.done == 'true'
-        run: |
-          set -euo pipefail
-          HOST="${{ steps.ec2ip.outputs.public_ip }}"
-          USER="${{ secrets.EC2_USER }}"
-          RUN_ID="${{ steps.donecheck.outputs.run_id }}"
-
-          KEY_FILE="$(mktemp)"
-          echo "${{ secrets.EC2_SSH_KEY }}" > "$KEY_FILE"
-          chmod 600 "$KEY_FILE"
-
-          scp -o StrictHostKeyChecking=no -i "$KEY_FILE" \
-            "$USER@$HOST:/tmp/run_${RUN_ID}.tgz" "./run_${RUN_ID}.tgz"
-
-      - name: Upload GitHub artifact
-        if: steps.donecheck.outputs.done == 'true'
-        uses: actions/upload-artifact@v4
+      - name: Stop docker compose on EC2 (cleanup)
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          EC2_PATH: ${{ secrets.EC2_PATH }}
         with:
-          name: ec2-run-${{ steps.donecheck.outputs.run_id }}
-          path: ./run_${{ steps.donecheck.outputs.run_id }}.tgz
-          retention-days: 30
+          host: ${{ steps.ec2ip.outputs.public_ip }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: 22
+          script_stop: false
+          command_timeout: 15m
+          envs: EC2_PATH
+          script: |
+            set -euo pipefail
+            cd "$EC2_PATH"
 
-      - name: Slack alert (optional)
-        if: steps.donecheck.outputs.done == 'true' && secrets.SLACK_WEBHOOK_URL != ''
-        run: |
-          set -euo pipefail
-          RUN_ID="${{ steps.donecheck.outputs.run_id }}"
-          curl -X POST -H 'Content-type: application/json' \
-            --data "{\"text\":\"✅ EC2 run *${RUN_ID}* finished. GitHub artifact uploaded: ec2-run-${RUN_ID}\"}" \
-            "${{ secrets.SLACK_WEBHOOK_URL }}"
+            if docker compose version >/dev/null 2>&1; then
+              COMPOSE="docker compose"
+            elif command -v docker-compose >/dev/null 2>&1; then
+              COMPOSE="docker-compose"
+            else
+              echo "No compose found, skipping compose down."
+              exit 0
+            fi
+
+            echo "Stopping compose..."
+            $COMPOSE down || true
+            echo "Compose stopped."
 
       - name: Stop EC2 instance
-        if: steps.donecheck.outputs.done == 'true'
         run: |
           set -euo pipefail
           INSTANCE_ID="${{ secrets.EC2_INSTANCE_ID }}"

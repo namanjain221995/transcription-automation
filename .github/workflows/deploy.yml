@@ -30,9 +30,7 @@ jobs:
           set -euo pipefail
           INSTANCE_ID="${{ secrets.EC2_INSTANCE_ID }}"
           aws ec2 start-instances --instance-ids "$INSTANCE_ID" >/dev/null
-          echo "Waiting for instance to be running..."
           aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
-          echo "EC2 is running."
 
       - name: Get EC2 Public IP
         id: ec2ip
@@ -48,18 +46,13 @@ jobs:
             exit 1
           fi
           echo "public_ip=$IP" >> "$GITHUB_OUTPUT"
-          echo "EC2 Public IP: $IP"
 
       - name: Wait for SSH (port 22)
         run: |
           set -euo pipefail
           HOST="${{ steps.ec2ip.outputs.public_ip }}"
-          echo "Waiting for SSH on $HOST:22 ..."
           for i in {1..120}; do
-            if nc -z -w 5 "$HOST" 22; then
-              echo "SSH reachable."
-              exit 0
-            fi
+            if nc -z -w 5 "$HOST" 22; then exit 0; fi
             sleep 5
           done
           echo "ERROR: SSH not reachable."
@@ -68,10 +61,10 @@ jobs:
       - name: Deploy and start compose in background (detached)
         uses: appleboy/ssh-action@v1.0.3
         env:
-          EC2_PATH: ${{ secrets.EC2_PATH }}   # /home/ec2-user/transcription-automation
+          EC2_PATH: ${{ secrets.EC2_PATH }}
         with:
           host: ${{ steps.ec2ip.outputs.public_ip }}
-          username: ${{ secrets.EC2_USER }}   # ec2-user
+          username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
           port: 22
           script_stop: true
@@ -80,63 +73,30 @@ jobs:
           script: |
             set -euo pipefail
 
-            echo "== Validate EC2_PATH =="
-            echo "EC2_PATH=$EC2_PATH"
-            if [ -z "${EC2_PATH:-}" ]; then
-              echo "ERROR: EC2_PATH empty"
-              exit 1
-            fi
-            if [ ! -d "$EC2_PATH" ]; then
-              echo "ERROR: EC2_PATH does not exist: $EC2_PATH"
-              exit 1
-            fi
-
             cd "$EC2_PATH"
-            echo "== Project dir =="
-            pwd
-            ls -la
-
-            echo "== Ensure runs dir =="
             mkdir -p "$EC2_PATH/runs"
 
-            echo "== Ensure git installed =="
-            if ! command -v git >/dev/null 2>&1; then
-              sudo yum install -y git || sudo dnf install -y git
-            fi
-
-            echo "== Pull latest code =="
             git fetch --all
             git reset --hard origin/main
 
-            echo "== Ensure docker running =="
             sudo systemctl enable docker || true
             sudo systemctl start docker || true
-            docker --version
 
-            echo "== Pick compose command =="
             if docker compose version >/dev/null 2>&1; then
               COMPOSE="docker compose"
             elif command -v docker-compose >/dev/null 2>&1; then
               COMPOSE="docker-compose"
             else
-              echo "docker compose not found. Installing docker-compose v2 binary..."
               sudo curl -L "https://github.com/docker/compose/releases/download/v2.27.0/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
               sudo chmod +x /usr/local/bin/docker-compose
               COMPOSE="docker-compose"
             fi
-            $COMPOSE version
 
-            echo "== Create RUN_ID markers =="
             RUN_ID="$(date +%Y%m%d_%H%M%S)"
             RUN_DIR="$EC2_PATH/runs/$RUN_ID"
             mkdir -p "$RUN_DIR"
             echo "$RUN_ID" | tee "$EC2_PATH/LAST_RUN_ID"
-            echo "RUN_ID=$RUN_ID"
-            echo "RUN_DIR=$RUN_DIR"
 
-            echo "== Start compose (durable detached) =="
-            # IMPORTANT: use DOUBLE QUOTES so $RUN_DIR expands
-            # setsid + nohup + </dev/null makes it survive SSH disconnects
             setsid nohup bash -lc "
               set +e
               cd '$EC2_PATH'
@@ -150,5 +110,5 @@ jobs:
             " > "$RUN_DIR/run.log" 2>&1 < /dev/null &
 
             echo $! | tee "$RUN_DIR/pid.txt"
-            echo "Detached PID=$(cat "$RUN_DIR/pid.txt")"
-            echo "Log file: $RUN_DIR/run.log"
+            echo "RUN_ID=$RUN_ID"
+            echo "PID=$(cat "$RUN_DIR/pid.txt")"
