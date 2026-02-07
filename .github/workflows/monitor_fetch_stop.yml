@@ -3,7 +3,7 @@ name: EC2 Monitor -> Stop Docker -> Stop EC2
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/5 * * * *"   # change to */1 or */2 if you want
+    - cron: "*/5 * * * *"   # every 5 minutes (GitHub schedules can delay)
 
 permissions:
   id-token: write
@@ -31,10 +31,10 @@ jobs:
           echo "state=$STATE" >> "$GITHUB_OUTPUT"
           echo "Instance state: $STATE"
 
-      - name: Exit safely if instance not running
+      - name: Exit if instance not running
         if: steps.state.outputs.state != 'running'
         run: |
-          echo "Instance is not running. Nothing to do."
+          echo "Instance not running. Nothing to do."
           exit 0
 
       - name: Get EC2 Public IP
@@ -42,25 +42,18 @@ jobs:
         run: |
           set -euo pipefail
           INSTANCE_ID="${{ secrets.EC2_INSTANCE_ID }}"
-          IP="$(aws ec2 describe-instances \
-            --instance-ids "$INSTANCE_ID" \
-            --query 'Reservations[0].Instances[0].PublicIpAddress' \
-            --output text)"
+          IP="$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)"
           if [ "$IP" = "None" ] || [ -z "$IP" ]; then
-            echo "No public IP yet. Exiting safely."
+            echo "No public IP. Exiting safely."
             exit 0
           fi
           echo "public_ip=$IP" >> "$GITHUB_OUTPUT"
-          echo "EC2 Public IP: $IP"
 
       - name: Wait for SSH (port 22)
         run: |
           set -euo pipefail
           HOST="${{ steps.ec2ip.outputs.public_ip }}"
-          if [ -z "${HOST:-}" ]; then
-            echo "No host IP. Exiting safely."
-            exit 0
-          fi
           for i in {1..24}; do
             if nc -z -w 5 "$HOST" 22; then
               echo "SSH reachable."
@@ -68,11 +61,11 @@ jobs:
             fi
             sleep 5
           done
-          echo "SSH not reachable yet. Exiting safely."
+          echo "SSH not reachable. Exiting safely."
           exit 0
 
-      - name: Bulletproof done check (exit_code exists AND no running compose)
-        id: donecheck
+      - name: Check if container is still running (container_id.txt)
+        id: decide
         run: |
           set -euo pipefail
           HOST="${{ steps.ec2ip.outputs.public_ip }}"
@@ -83,59 +76,53 @@ jobs:
           echo "${{ secrets.EC2_SSH_KEY }}" > "$KEY_FILE"
           chmod 600 "$KEY_FILE"
 
-          STATUS="$(ssh -o StrictHostKeyChecking=no -i "$KEY_FILE" "$USER@$HOST" "
+          OUT="$(ssh -o StrictHostKeyChecking=no -i "$KEY_FILE" "$USER@$HOST" "
             set -euo pipefail
             cd '$EC2_PATH'
 
-            # Need LAST_RUN_ID
             if [ ! -f LAST_RUN_ID ]; then
-              echo 'NO_RUN'
+              echo 'SAFE_STOP=false REASON=no_LAST_RUN_ID'
               exit 0
             fi
 
             RUN_ID=\$(cat LAST_RUN_ID)
-            echo \"RUN_ID=\$RUN_ID\" 1>&2
 
-            # Condition 1: exit_code.txt must exist
-            if [ ! -f \"runs/\$RUN_ID/exit_code.txt\" ]; then
-              echo 'RUNNING'
+            if [ ! -f runs/\$RUN_ID/container_id.txt ]; then
+              echo 'SAFE_STOP=false REASON=missing_container_id'
               exit 0
             fi
 
-            # Pick compose command (prefer docker-compose)
-            if command -v docker-compose >/dev/null 2>&1; then
-              COMPOSE='docker-compose'
-            elif docker compose version >/dev/null 2>&1; then
-              COMPOSE='docker compose'
-            else
-              # If no compose, treat as not running (safe)
-              echo 'DONE'
+            CID=\$(cat runs/\$RUN_ID/container_id.txt)
+
+            # If container is still running -> do NOT stop
+            RUNNING=\$(docker inspect -f '{{.State.Running}}' \"\$CID\" 2>/dev/null || echo 'missing')
+            if [ \"\$RUNNING\" = 'true' ]; then
+              echo 'SAFE_STOP=false REASON=container_running'
               exit 0
             fi
 
-            # Condition 2: no running compose containers
-            if \$COMPOSE ps --status running -q | grep -q .; then
-              echo 'RUNNING'
+            # If container is NOT running/missing -> require exit_code.txt to exist
+            if [ -f runs/\$RUN_ID/exit_code.txt ]; then
+              echo 'SAFE_STOP=true REASON=container_stopped_and_exit_code_exists'
             else
-              echo 'DONE'
+              echo 'SAFE_STOP=false REASON=container_stopped_but_exit_code_missing'
             fi
           " || true)"
 
-          echo "Remote status: $STATUS"
-
-          if [ "$STATUS" = "DONE" ]; then
-            echo "done=true" >> "$GITHUB_OUTPUT"
+          echo "$OUT"
+          if echo "$OUT" | grep -q 'SAFE_STOP=true'; then
+            echo "safe_stop=true" >> "$GITHUB_OUTPUT"
           else
-            echo "done=false" >> "$GITHUB_OUTPUT"
+            echo "safe_stop=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Exit if still running
-        if: steps.donecheck.outputs.done != 'true'
+      - name: Exit if not safe to stop
+        if: steps.decide.outputs.safe_stop != 'true'
         run: |
-          echo "Not done yet (either docker still running OR exit_code missing)."
+          echo "Not safe to stop yet (docker still running or markers missing)."
           exit 0
 
-      - name: Stop docker compose on EC2 (final cleanup)
+      - name: Stop docker compose on EC2 (cleanup)
         uses: appleboy/ssh-action@v1.0.3
         env:
           EC2_PATH: ${{ secrets.EC2_PATH }}
@@ -150,19 +137,12 @@ jobs:
           script: |
             set -euo pipefail
             cd "$EC2_PATH"
-
             if command -v docker-compose >/dev/null 2>&1; then
-              COMPOSE="docker-compose"
+              docker-compose down || true
             elif docker compose version >/dev/null 2>&1; then
-              COMPOSE="docker compose"
-            else
-              echo "No compose found. Skipping cleanup."
-              exit 0
+              docker compose down || true
             fi
-
-            echo "Stopping compose..."
-            $COMPOSE down || true
-            echo "Compose stopped."
+            echo "Compose cleanup done."
 
       - name: Stop EC2 instance
         run: |
