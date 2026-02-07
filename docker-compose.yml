@@ -9,10 +9,17 @@ services:
     env_file:
       - .env
     environment:
-      PYTHONUNBUFFERED: "1"
-      AWS_EC2_METADATA_DISABLED: "false"
+      - PYTHONUNBUFFERED=1
     volumes:
       - .:/app
-    working_dir: /app
-    network_mode: "host"
-    command: ["bash", "/app/entrypoint.sh"]
+      - /app/.venv
+    command: >
+      sh -c "
+        pip install --no-cache-dir -r requirements.txt && python test4.py && python test5.py && python test6.py && python test7.py && python test8.py && python test9.py 
+      "
+    networks:
+      - test_network
+
+networks:
+  test_network:
+    driver: bridge
