@@ -3,7 +3,7 @@ name: EC2 Monitor -> Stop Docker -> Stop EC2
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/5 * * * *"   # change to */1 if you want, but GitHub may delay
 
 permissions:
   id-token: write
@@ -31,7 +31,7 @@ jobs:
           echo "state=$STATE" >> "$GITHUB_OUTPUT"
           echo "Instance state: $STATE"
 
-      - name: Exit if instance not running
+      - name: Exit cleanly if instance not running
         if: steps.state.outputs.state != 'running'
         run: |
           echo "Instance is not running. Nothing to do."
@@ -47,54 +47,78 @@ jobs:
             --query 'Reservations[0].Instances[0].PublicIpAddress' \
             --output text)"
           if [ "$IP" = "None" ] || [ -z "$IP" ]; then
-            echo "ERROR: Could not get Public IP."
-            exit 1
+            echo "No public IP yet. Exiting safely."
+            exit 0
           fi
           echo "public_ip=$IP" >> "$GITHUB_OUTPUT"
+          echo "EC2 Public IP: $IP"
 
       - name: Wait for SSH (port 22)
         run: |
           set -euo pipefail
           HOST="${{ steps.ec2ip.outputs.public_ip }}"
-          for i in {1..60}; do
-            if nc -z -w 5 "$HOST" 22; then exit 0; fi
+          if [ -z "${HOST:-}" ]; then
+            echo "No host IP. Exiting safely."
+            exit 0
+          fi
+          for i in {1..24}; do
+            if nc -z -w 5 "$HOST" 22; then
+              echo "SSH reachable."
+              exit 0
+            fi
             sleep 5
           done
-          echo "ERROR: SSH not reachable."
-          exit 1
+          echo "SSH not reachable yet. Exiting safely."
+          exit 0
 
-      - name: Check if run finished (exit_code.txt exists)
-        id: donecheck
+      - name: Check if Docker Compose is still running on EC2
+        id: runningcheck
         run: |
           set -euo pipefail
           HOST="${{ steps.ec2ip.outputs.public_ip }}"
           USER="${{ secrets.EC2_USER }}"
+          EC2_PATH="${{ secrets.EC2_PATH }}"
+
           KEY_FILE="$(mktemp)"
           echo "${{ secrets.EC2_SSH_KEY }}" > "$KEY_FILE"
           chmod 600 "$KEY_FILE"
 
-          if ! ssh -o StrictHostKeyChecking=no -i "$KEY_FILE" "$USER@$HOST" \
-            "cd '${{ secrets.EC2_PATH }}' && test -f LAST_RUN_ID"; then
-            echo "done=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+          # This command prints RUNNING if any compose container is running, else NOT_RUNNING.
+          STATUS="$(ssh -o StrictHostKeyChecking=no -i "$KEY_FILE" "$USER@$HOST" "
+            set -euo pipefail
+            cd '$EC2_PATH'
 
-          RUN_ID="$(ssh -o StrictHostKeyChecking=no -i "$KEY_FILE" "$USER@$HOST" \
-            "cd '${{ secrets.EC2_PATH }}' && cat LAST_RUN_ID")"
+            # Pick compose command
+            if docker compose version >/dev/null 2>&1; then
+              COMPOSE='docker compose'
+            elif command -v docker-compose >/dev/null 2>&1; then
+              COMPOSE='docker-compose'
+            else
+              echo 'NO_COMPOSE'
+              exit 0
+            fi
 
-          if ssh -o StrictHostKeyChecking=no -i "$KEY_FILE" "$USER@$HOST" \
-            "cd '${{ secrets.EC2_PATH }}' && test -f 'runs/${RUN_ID}/exit_code.txt'"; then
-            echo "done=true" >> "$GITHUB_OUTPUT"
-            echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+            # Are any containers running for this compose project?
+            # If yes -> RUNNING
+            if \$COMPOSE ps --status running -q | grep -q .; then
+              echo 'RUNNING'
+            else
+              echo 'NOT_RUNNING'
+            fi
+          " || true)"
+
+          echo "Remote compose status: $STATUS"
+
+          if [ "$STATUS" = "RUNNING" ]; then
+            echo "running=true" >> "$GITHUB_OUTPUT"
           else
-            echo "done=false" >> "$GITHUB_OUTPUT"
-            echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+            echo "running=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Exit if still running
-        if: steps.donecheck.outputs.done != 'true'
+      - name: Exit if Docker Compose is still running
+        if: steps.runningcheck.outputs.running == 'true'
         run: |
-          echo "Run still running (RUN_ID=${{ steps.donecheck.outputs.run_id }})."
+          echo "Docker Compose is still running. Will NOT stop EC2."
           exit 0
 
       - name: Stop docker compose on EC2 (cleanup)
