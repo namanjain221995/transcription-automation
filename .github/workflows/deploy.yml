@@ -1,4 +1,4 @@
-name: Start EC2 -> Run Docker Compose -> Stop EC2
+name: EC2 Deploy (Start -> Deploy -> Stop)
 
 on:
   push:
@@ -9,32 +9,40 @@ permissions:
   id-token: write
   contents: read
 
+concurrency:
+  group: ec2-deploy-main
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+
 jobs:
-  deploy:
+  start_instance:
+    name: Start Instance
     runs-on: ubuntu-latest
-    timeout-minutes: 960
+    outputs:
+      public_ip: ${{ steps.ec2ip.outputs.public_ip }}
 
     steps:
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}   # arn:aws:iam::127358876344:role/github-ec2-role
-          aws-region: ${{ secrets.AWS_REGION }}         # us-east-1
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Start EC2 instance (if stopped)
+      - name: Start EC2 instance
         run: |
-          set -e
-          INSTANCE_ID="${{ secrets.EC2_INSTANCE_ID }}"
-          aws ec2 start-instances --instance-ids "$INSTANCE_ID" >/dev/null || true
+          set -euo pipefail
+          aws ec2 start-instances --instance-ids "$INSTANCE_ID" >/dev/null
           echo "Waiting for instance to be running..."
           aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
           echo "EC2 is running."
 
-      - name: Get EC2 Public IP (after start)
+      - name: Get EC2 Public IP
         id: ec2ip
         run: |
-          set -e
-          INSTANCE_ID="${{ secrets.EC2_INSTANCE_ID }}"
+          set -euo pipefail
           IP="$(aws ec2 describe-instances \
             --instance-ids "$INSTANCE_ID" \
             --query 'Reservations[0].Instances[0].PublicIpAddress' \
@@ -46,17 +54,24 @@ jobs:
           echo "public_ip=$IP" >> "$GITHUB_OUTPUT"
           echo "EC2 Public IP: $IP"
 
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    needs: [start_instance]
+    timeout-minutes: 960
+
+    steps:
       - name: Wait for SSH (port 22) to be ready
         run: |
-          set -e
-          HOST="${{ steps.ec2ip.outputs.public_ip }}"
+          set -euo pipefail
+          HOST="${{ needs.start_instance.outputs.public_ip }}"
           echo "Waiting for SSH on $HOST:22 ..."
-          for i in {1..60}; do
+          for i in {1..120}; do
             if nc -z -w 5 "$HOST" 22; then
               echo "SSH is reachable."
               exit 0
             fi
-            echo "Still waiting ($i/60)..."
+            echo "Still waiting ($i/120)..."
             sleep 5
           done
           echo "ERROR: SSH not reachable after waiting."
@@ -65,10 +80,10 @@ jobs:
       - name: Deploy and run on EC2 via SSH (docker compose)
         uses: appleboy/ssh-action@v1.0.3
         env:
-          EC2_PATH: ${{ secrets.EC2_PATH }}   # /home/ec2-user/transcription-automation
+          EC2_PATH: ${{ secrets.EC2_PATH }}   # e.g. /home/ec2-user/transcription-automation
         with:
-          host: ${{ steps.ec2ip.outputs.public_ip }}
-          username: ${{ secrets.EC2_USER }}   # ec2-user
+          host: ${{ needs.start_instance.outputs.public_ip }}
+          username: ${{ secrets.EC2_USER }}   # e.g. ec2-user
           key: ${{ secrets.EC2_SSH_KEY }}
           port: 22
           script_stop: true
@@ -127,19 +142,33 @@ jobs:
 
             echo "== Run pipeline =="
             $COMPOSE down || true
-            $COMPOSE up --build --abort-on-container-exit --exit-code-from test_runner
+            $COMPOSE up --build --abort-on-container-exit --exit-code-from test_runner || {
+              echo "== Compose failed, printing logs =="
+              $COMPOSE logs --no-color || true
+              exit 1
+            }
 
             echo "== Cleanup =="
             $COMPOSE down || true
-
             echo "== DONE =="
 
-      - name: Stop EC2 instance (always)
-        if: always()
+  stop_instance:
+    name: Stop Instance
+    runs-on: ubuntu-latest
+    needs: [start_instance, deploy]
+    if: always()
+
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Stop EC2 instance (not terminating)
         run: |
-          set -e
-          INSTANCE_ID="${{ secrets.EC2_INSTANCE_ID }}"
-          echo "Stopping EC2 instance (not terminating)..."
+          set -euo pipefail
+          echo "Stopping EC2 instance..."
           aws ec2 stop-instances --instance-ids "$INSTANCE_ID" >/dev/null || true
           echo "Waiting for instance to stop..."
           aws ec2 wait instance-stopped --instance-ids "$INSTANCE_ID"
