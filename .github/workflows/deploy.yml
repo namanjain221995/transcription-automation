@@ -29,8 +29,9 @@ jobs:
         run: |
           set -euo pipefail
           INSTANCE_ID="${{ secrets.EC2_INSTANCE_ID }}"
-          aws ec2 start-instances --instance-ids "$INSTANCE_ID" >/dev/null
+          aws ec2 start-instances --instance-ids "$INSTANCE_ID" >/dev/null || true
           aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
+          echo "EC2 running."
 
       - name: Get EC2 Public IP
         id: ec2ip
@@ -42,17 +43,22 @@ jobs:
             --query 'Reservations[0].Instances[0].PublicIpAddress' \
             --output text)"
           if [ "$IP" = "None" ] || [ -z "$IP" ]; then
-            echo "ERROR: Could not get Public IP for instance $INSTANCE_ID"
+            echo "ERROR: No public IP after start."
             exit 1
           fi
           echo "public_ip=$IP" >> "$GITHUB_OUTPUT"
+          echo "EC2 Public IP: $IP"
 
       - name: Wait for SSH (port 22)
         run: |
           set -euo pipefail
           HOST="${{ steps.ec2ip.outputs.public_ip }}"
+          echo "Waiting for SSH on $HOST:22 ..."
           for i in {1..120}; do
-            if nc -z -w 5 "$HOST" 22; then exit 0; fi
+            if nc -z -w 5 "$HOST" 22; then
+              echo "SSH reachable."
+              exit 0
+            fi
             sleep 5
           done
           echo "ERROR: SSH not reachable."
@@ -73,30 +79,51 @@ jobs:
           script: |
             set -euo pipefail
 
+            echo "== Validate EC2_PATH =="
+            if [ -z "${EC2_PATH:-}" ]; then
+              echo "ERROR: EC2_PATH empty"
+              exit 1
+            fi
+            if [ ! -d "$EC2_PATH" ]; then
+              echo "ERROR: EC2_PATH does not exist: $EC2_PATH"
+              exit 1
+            fi
+
             cd "$EC2_PATH"
             mkdir -p "$EC2_PATH/runs"
 
+            echo "== Update code =="
             git fetch --all
             git reset --hard origin/main
 
+            echo "== Ensure docker running =="
             sudo systemctl enable docker || true
             sudo systemctl start docker || true
+            docker --version || true
 
-            if docker compose version >/dev/null 2>&1; then
-              COMPOSE="docker compose"
-            elif command -v docker-compose >/dev/null 2>&1; then
+            echo "== Pick compose command (prefer docker-compose if available) =="
+            if command -v docker-compose >/dev/null 2>&1; then
               COMPOSE="docker-compose"
+            elif docker compose version >/dev/null 2>&1; then
+              COMPOSE="docker compose"
             else
+              echo "No compose found; installing docker-compose v2 binary..."
               sudo curl -L "https://github.com/docker/compose/releases/download/v2.27.0/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
               sudo chmod +x /usr/local/bin/docker-compose
               COMPOSE="docker-compose"
             fi
+            $COMPOSE version || true
 
+            echo "== Create RUN_ID markers =="
             RUN_ID="$(date +%Y%m%d_%H%M%S)"
             RUN_DIR="$EC2_PATH/runs/$RUN_ID"
             mkdir -p "$RUN_DIR"
             echo "$RUN_ID" | tee "$EC2_PATH/LAST_RUN_ID"
 
+            echo "RUN_ID=$RUN_ID"
+            echo "RUN_DIR=$RUN_DIR"
+
+            echo "== Start compose (durable detached) =="
             setsid nohup bash -lc "
               set +e
               cd '$EC2_PATH'
@@ -110,5 +137,5 @@ jobs:
             " > "$RUN_DIR/run.log" 2>&1 < /dev/null &
 
             echo $! | tee "$RUN_DIR/pid.txt"
-            echo "RUN_ID=$RUN_ID"
-            echo "PID=$(cat "$RUN_DIR/pid.txt")"
+            echo "Detached PID=$(cat "$RUN_DIR/pid.txt")"
+            echo "Log file: $RUN_DIR/run.log"
