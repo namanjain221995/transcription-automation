@@ -2,12 +2,14 @@ import os
 import io
 import json
 import re
+import time
+import random
 import tempfile
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
 from dotenv import load_dotenv
-from openpyxl import load_workbook, Workbook
+from openpyxl import load_workbook
 from openpyxl.styles import Font, Alignment
 from openpyxl.utils import get_column_letter
 
@@ -24,6 +26,7 @@ from google.auth.transport.requests import Request
 load_dotenv()
 SLOT_CHOICE = (os.getenv("SLOT_CHOICE") or "").strip()
 USE_SHARED_DRIVES = (os.getenv("USE_SHARED_DRIVES") or "").strip().lower() in ("1", "true", "yes", "y")
+HEADLESS_AUTH = (os.getenv("HEADLESS_AUTH") or "").strip().lower() in ("1", "true", "yes", "y")
 
 # =========================
 # CONFIG
@@ -56,10 +59,53 @@ EYE_RESULT_RX = re.compile(r".*__EYE_result\.json$", re.IGNORECASE)
 NEW_SHEET_NAME = "eye moments analysis"
 
 # =========================
+# RETRIES (Drive)
+# =========================
+def execute_with_retries(request, *, max_retries: int = 8, base_sleep: float = 1.0):
+    for attempt in range(max_retries):
+        try:
+            return request.execute()
+        except HttpError as e:
+            status = getattr(e.resp, "status", None)
+            if status in (429, 500, 502, 503, 504):
+                if attempt == max_retries - 1:
+                    raise
+                sleep = (base_sleep * (2 ** attempt)) + random.random()
+                print(f"[WARN] Drive transient HTTP {status}. Retry in {sleep:.1f}s")
+                time.sleep(sleep)
+                continue
+            raise
+
+# =========================
+# Shared Drives kwargs (SAFE per method)
+# =========================
+def _kwargs_for_list() -> Dict[str, Any]:
+    # ONLY for files().list()
+    if USE_SHARED_DRIVES:
+        return {
+            "supportsAllDrives": True,
+            "includeItemsFromAllDrives": True,
+            "corpora": "allDrives",
+        }
+    return {}
+
+def _kwargs_for_mutation() -> Dict[str, Any]:
+    # create/update/delete
+    if USE_SHARED_DRIVES:
+        return {"supportsAllDrives": True}
+    return {}
+
+def _kwargs_for_get_media() -> Dict[str, Any]:
+    # get_media/export_media
+    if USE_SHARED_DRIVES:
+        return {"supportsAllDrives": True}
+    return {}
+
+# =========================
 # Drive auth
 # =========================
 def get_drive_service():
-    creds = None
+    creds: Optional[Credentials] = None
     if TOKEN_FILE.exists():
         creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
 
@@ -82,44 +128,52 @@ def get_drive_service():
             if not CREDENTIALS_FILE.exists():
                 raise FileNotFoundError("credentials.json not found next to this script.")
             flow = InstalledAppFlow.from_client_secrets_file(str(CREDENTIALS_FILE), SCOPES)
-            # NOTE: In Docker/headless you may want flow.run_console()
-            creds = flow.run_local_server(port=0)
+
+            # Headless-safe auth
+            if HEADLESS_AUTH or not os.environ.get("DISPLAY"):
+                creds = flow.run_console()
+            else:
+                creds = flow.run_local_server(port=0)
+
             TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
 
     return build("drive", "v3", credentials=creds)
-
-
-def _list_kwargs():
-    if USE_SHARED_DRIVES:
-        return {"supportsAllDrives": True, "includeItemsFromAllDrives": True, "corpora": "allDrives"}
-    return {}
-
-
-def _get_media_kwargs():
-    if USE_SHARED_DRIVES:
-        return {"supportsAllDrives": True}
-    return {}
-
 
 # =========================
 # Drive helpers
 # =========================
 def _escape_drive_q_value(s: str) -> str:
-    return s.replace("'", "''")
-
+    """
+    Drive query string values:
+      - escape backslash first
+      - escape single quote as \'
+    """
+    return s.replace("\\", "\\\\").replace("'", "\\'")
 
 def drive_search_folder_anywhere(service, folder_name: str) -> List[dict]:
     safe_name = _escape_drive_q_value(folder_name)
     q = f"name = '{safe_name}' and mimeType = '{FOLDER_MIME}' and trashed=false"
-    res = service.files().list(
-        q=q, fields="files(id,name,parents,modifiedTime)", pageSize=200, **_list_kwargs()
-    ).execute()
-    return res.get("files", []) or []
 
+    out: List[dict] = []
+    page_token = None
+    while True:
+        res = execute_with_retries(
+            service.files().list(
+                q=q,
+                fields="nextPageToken, files(id,name,parents,modifiedTime)",
+                pageSize=1000,
+                pageToken=page_token,
+                **_kwargs_for_list(),
+            )
+        )
+        out.extend(res.get("files", []) or [])
+        page_token = res.get("nextPageToken")
+        if not page_token:
+            break
+    return out
 
 def pick_best_named_folder(candidates: List[dict]) -> dict:
     return sorted(candidates, key=lambda c: (c.get("modifiedTime") or ""), reverse=True)[0]
-
 
 def drive_list_children(service, parent_id: str, mime_type: Optional[str] = None):
     q_parts = [f"'{parent_id}' in parents", "trashed = false"]
@@ -129,21 +183,22 @@ def drive_list_children(service, parent_id: str, mime_type: Optional[str] = None
 
     page_token = None
     while True:
-        res = service.files().list(
-            q=q,
-            fields="nextPageToken, files(id,name,mimeType,modifiedTime,size)",
-            pageSize=1000,
-            pageToken=page_token,
-            **_list_kwargs(),
-        ).execute()
+        res = execute_with_retries(
+            service.files().list(
+                q=q,
+                fields="nextPageToken, files(id,name,mimeType,modifiedTime,size)",
+                pageSize=1000,
+                pageToken=page_token,
+                **_kwargs_for_list(),
+            )
+        )
 
-        for f in res.get("files", []):
+        for f in res.get("files", []) or []:
             yield f
 
         page_token = res.get("nextPageToken")
         if not page_token:
             break
-
 
 def drive_find_child(service, parent_id: str, name: str, mime_type: Optional[str] = None) -> Optional[dict]:
     safe = _escape_drive_q_value(name)
@@ -152,50 +207,78 @@ def drive_find_child(service, parent_id: str, name: str, mime_type: Optional[str
         q_parts.append(f"mimeType = '{mime_type}'")
     q = " and ".join(q_parts)
 
-    res = service.files().list(
-        q=q, fields="files(id,name,mimeType,parents,modifiedTime)", pageSize=50, **_list_kwargs()
-    ).execute()
+    res = execute_with_retries(
+        service.files().list(
+            q=q,
+            fields="files(id,name,mimeType,parents,modifiedTime)",
+            pageSize=50,
+            **_kwargs_for_list(),
+        )
+    )
     files = res.get("files", []) or []
     if not files:
         return None
     return sorted(files, key=lambda f: f.get("modifiedTime") or "", reverse=True)[0]
 
-
 def drive_download_bytes(service, file_id: str) -> bytes:
-    request = service.files().get_media(fileId=file_id, **_get_media_kwargs())
+    request = service.files().get_media(fileId=file_id, **_kwargs_for_get_media())
     fh = io.BytesIO()
-    downloader = MediaIoBaseDownload(fh, request, chunksize=1024 * 1024 * 4)
+    downloader = MediaIoBaseDownload(fh, request, chunksize=1024 * 1024 * 8)
     done = False
     while not done:
-        _, done = downloader.next_chunk()
+        try:
+            _, done = downloader.next_chunk()
+        except HttpError as e:
+            status = getattr(e.resp, "status", None)
+            if status in (429, 500, 502, 503, 504):
+                sleep = 1.0 + random.random()
+                print(f"[WARN] Download transient HTTP {status}. Retry in {sleep:.1f}s")
+                time.sleep(sleep)
+                continue
+            raise
     fh.seek(0)
     return fh.read()
-
 
 def drive_download_to_path(service, file_id: str, dest_path: Path):
     dest_path.write_bytes(drive_download_bytes(service, file_id))
 
-
 def drive_upload_xlsx(service, parent_id: str, filename: str, local_path: Path) -> str:
+    """
+    Upload (create/update) XLSX into parent folder.
+    IMPORTANT: use mutation kwargs (supportsAllDrives only), not list kwargs.
+    """
     existing = drive_find_child(service, parent_id, filename, None)
     media = MediaFileUpload(str(local_path), mimetype=XLSX_MIME, resumable=True)
 
     if existing:
-        service.files().update(fileId=existing["id"], media_body=media, **_list_kwargs()).execute()
+        execute_with_retries(
+            service.files().update(
+                fileId=existing["id"],
+                media_body=media,
+                **_kwargs_for_mutation(),
+            )
+        )
         return existing["id"]
     else:
         meta = {"name": filename, "parents": [parent_id]}
-        created = service.files().create(body=meta, media_body=media, fields="id", **_list_kwargs()).execute()
+        created = execute_with_retries(
+            service.files().create(
+                body=meta,
+                media_body=media,
+                fields="id",
+                **_kwargs_for_mutation(),
+            )
+        )
         return created["id"]
-
 
 # =========================
 # SLOT SELECTION
 # =========================
 def list_slot_folders(service, slots_parent_id: str) -> List[dict]:
-    return sorted(list(drive_list_children(service, slots_parent_id, FOLDER_MIME)),
-                  key=lambda x: (x.get("name") or "").lower())
-
+    return sorted(
+        list(drive_list_children(service, slots_parent_id, FOLDER_MIME)),
+        key=lambda x: (x.get("name") or "").lower()
+    )
 
 def choose_slot(service, slots_parent_id: str) -> dict:
     slots = list_slot_folders(service, slots_parent_id)
@@ -227,7 +310,6 @@ def choose_slot(service, slots_parent_id: str) -> dict:
                 return slots[idx - 1]
         print("Invalid choice. Try again.")
 
-
 # =========================
 # Eye score extraction
 # =========================
@@ -240,7 +322,6 @@ def safe_float(x) -> Optional[float]:
     except Exception:
         return None
 
-
 def extract_eye_score(raw: bytes) -> Optional[float]:
     try:
         data = json.loads(raw.decode("utf-8", errors="ignore"))
@@ -251,7 +332,6 @@ def extract_eye_score(raw: bytes) -> Optional[float]:
         v = safe_float(data.get("score"))
         if v is not None:
             return v
-        # fallback nested
         for k in ("result", "data", "output"):
             if isinstance(data.get(k), dict):
                 v2 = safe_float(data[k].get("score"))
@@ -259,13 +339,11 @@ def extract_eye_score(raw: bytes) -> Optional[float]:
                     return v2
     return None
 
-
 def avg(values: List[float]) -> Optional[float]:
     vals = [float(v) for v in values if isinstance(v, (int, float))]
     if not vals:
         return None
     return round(sum(vals) / len(vals), 2)
-
 
 def compute_person_folder_eye_scores(service, person_folder_id: str) -> Dict[str, Optional[float]]:
     """
@@ -300,7 +378,6 @@ def compute_person_folder_eye_scores(service, person_folder_id: str) -> Dict[str
 
     return out
 
-
 # =========================
 # Excel helpers
 # =========================
@@ -309,7 +386,6 @@ def style_header_row(ws):
         cell = ws.cell(row=1, column=c)
         cell.font = Font(bold=True)
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-
 
 def autosize_columns(ws):
     for col in ws.columns:
@@ -320,17 +396,13 @@ def autosize_columns(ws):
             max_len = max(max_len, len(v))
         ws.column_dimensions[col_letter].width = min(max(12, max_len + 2), 60)
 
-
-def recreate_eye_sheet(wb) -> Any:
+def recreate_eye_sheet(wb):
     """
     Delete sheet if exists, then create a fresh one.
     """
     if NEW_SHEET_NAME in wb.sheetnames:
-        ws_old = wb[NEW_SHEET_NAME]
-        wb.remove(ws_old)
-    ws = wb.create_sheet(NEW_SHEET_NAME)
-    return ws
-
+        wb.remove(wb[NEW_SHEET_NAME])
+    return wb.create_sheet(NEW_SHEET_NAME)
 
 # =========================
 # MAIN
@@ -338,7 +410,7 @@ def recreate_eye_sheet(wb) -> Any:
 def main():
     service = get_drive_service()
 
-    # SOURCE 2026
+    # SOURCE 2026 (actually ROOT_2026_FOLDER_NAME)
     candidates_2026 = drive_search_folder_anywhere(service, ROOT_2026_FOLDER_NAME)
     if not candidates_2026:
         raise RuntimeError(f"Could not find folder '{ROOT_2026_FOLDER_NAME}' anywhere in Drive.")
@@ -348,7 +420,9 @@ def main():
     # OUTPUT ROOT
     candidates_out = drive_search_folder_anywhere(service, OUTPUT_ROOT_FOLDER_NAME)
     if not candidates_out:
-        raise RuntimeError(f"Could not find output folder '{OUTPUT_ROOT_FOLDER_NAME}' anywhere in Drive. Create it and run again.")
+        raise RuntimeError(
+            f"Could not find output folder '{OUTPUT_ROOT_FOLDER_NAME}' anywhere in Drive. Create it and run again."
+        )
     output_root = pick_best_named_folder(candidates_out)
     output_root_id = output_root["id"]
 
@@ -427,7 +501,6 @@ def main():
         drive_upload_xlsx(service, slot_out_id, OUTPUT_XLSX_NAME, local_xlsx)
 
     print("[DONE] Eye moments analysis sheet created/updated.")
-
 
 if __name__ == "__main__":
     main()

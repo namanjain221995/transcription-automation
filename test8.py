@@ -1,6 +1,9 @@
 import os
 import io
 import re
+import json
+import time
+import random
 import tempfile
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
@@ -22,6 +25,7 @@ from google.auth.transport.requests import Request
 # =========================================================
 SLOT_CHOICE = (os.getenv("SLOT_CHOICE") or "").strip()  # e.g. "2"
 USE_SHARED_DRIVES = (os.getenv("USE_SHARED_DRIVES") or "").strip().lower() in ("1", "true", "yes", "y")
+HEADLESS_AUTH = (os.getenv("HEADLESS_AUTH") or "").strip().lower() in ("1", "true", "yes", "y")
 
 # Thresholds (you can change in .env too)
 MIN_DELIVERABLES = float((os.getenv("MIN_DELIVERABLES") or "55").strip() or 55)
@@ -41,6 +45,42 @@ OUTPUT_XLSX_NAME = "Deliverables Analysis Sheet.xlsx"
 
 FOLDER_MIME = "application/vnd.google-apps.folder"
 
+# =========================================================
+# RETRIES
+# =========================================================
+def execute_with_retries(request, *, max_retries: int = 8, base_sleep: float = 1.0):
+    for attempt in range(max_retries):
+        try:
+            return request.execute()
+        except HttpError as e:
+            status = getattr(e.resp, "status", None)
+            if status in (429, 500, 502, 503, 504):
+                if attempt == max_retries - 1:
+                    raise
+                sleep = (base_sleep * (2 ** attempt)) + random.random()
+                print(f"[WARN] Drive transient HTTP {status}. Retry in {sleep:.1f}s")
+                time.sleep(sleep)
+                continue
+            raise
+
+# =========================================================
+# Shared Drives kwargs (SAFE per method)
+# =========================================================
+def _kwargs_for_list() -> Dict[str, Any]:
+    # ONLY for files().list()
+    if USE_SHARED_DRIVES:
+        return {
+            "supportsAllDrives": True,
+            "includeItemsFromAllDrives": True,
+            "corpora": "allDrives",
+        }
+    return {}
+
+def _kwargs_for_get_media() -> Dict[str, Any]:
+    # ONLY for get_media / export_media
+    if USE_SHARED_DRIVES:
+        return {"supportsAllDrives": True}
+    return {}
 
 # =========================================================
 # Drive Auth
@@ -69,44 +109,52 @@ def get_drive_service():
             if not CREDENTIALS_FILE.exists():
                 raise FileNotFoundError("credentials.json not found next to this script.")
             flow = InstalledAppFlow.from_client_secrets_file(str(CREDENTIALS_FILE), SCOPES)
-            # NOTE: In Docker/headless you may want flow.run_console()
-            creds = flow.run_local_server(port=0)
+
+            # ✅ server/headless-safe
+            if HEADLESS_AUTH or not os.environ.get("DISPLAY"):
+                creds = flow.run_console()
+            else:
+                creds = flow.run_local_server(port=0)
+
             TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
 
     return build("drive", "v3", credentials=creds)
-
-
-def _list_kwargs():
-    if USE_SHARED_DRIVES:
-        return {"supportsAllDrives": True, "includeItemsFromAllDrives": True, "corpora": "allDrives"}
-    return {}
-
-
-def _get_media_kwargs():
-    if USE_SHARED_DRIVES:
-        return {"supportsAllDrives": True}
-    return {}
-
 
 # =========================================================
 # Drive Helpers
 # =========================================================
 def _escape_drive_q_value(s: str) -> str:
-    return s.replace("'", "''")
-
+    """
+    Google Drive v3 query string escaping:
+      - escape backslash first
+      - escape single quote as \'
+    """
+    return s.replace("\\", "\\\\").replace("'", "\\'")
 
 def drive_search_folder_anywhere(service, folder_name: str) -> List[dict]:
     safe_name = _escape_drive_q_value(folder_name)
     q = f"name = '{safe_name}' and mimeType = '{FOLDER_MIME}' and trashed=false"
-    res = service.files().list(
-        q=q, fields="files(id,name,parents,modifiedTime)", pageSize=200, **_list_kwargs()
-    ).execute()
-    return res.get("files", []) or []
 
+    out: List[dict] = []
+    page_token = None
+    while True:
+        res = execute_with_retries(
+            service.files().list(
+                q=q,
+                fields="nextPageToken, files(id,name,parents,modifiedTime)",
+                pageSize=1000,
+                pageToken=page_token,
+                **_kwargs_for_list(),
+            )
+        )
+        out.extend(res.get("files", []) or [])
+        page_token = res.get("nextPageToken")
+        if not page_token:
+            break
+    return out
 
 def pick_best_named_folder(candidates: List[dict]) -> dict:
     return sorted(candidates, key=lambda c: c.get("modifiedTime") or "", reverse=True)[0]
-
 
 def drive_list_children(service, parent_id: str, mime_type: Optional[str] = None):
     q_parts = [f"'{parent_id}' in parents", "trashed = false"]
@@ -116,19 +164,20 @@ def drive_list_children(service, parent_id: str, mime_type: Optional[str] = None
 
     page_token = None
     while True:
-        res = service.files().list(
-            q=q,
-            fields="nextPageToken, files(id,name,mimeType,modifiedTime,size)",
-            pageSize=1000,
-            pageToken=page_token,
-            **_list_kwargs(),
-        ).execute()
-        for f in res.get("files", []):
+        res = execute_with_retries(
+            service.files().list(
+                q=q,
+                fields="nextPageToken, files(id,name,mimeType,modifiedTime,size)",
+                pageSize=1000,
+                pageToken=page_token,
+                **_kwargs_for_list(),
+            )
+        )
+        for f in res.get("files", []) or []:
             yield f
         page_token = res.get("nextPageToken")
         if not page_token:
             break
-
 
 def drive_find_child(service, parent_id: str, name: str, mime_type: Optional[str] = None) -> Optional[dict]:
     safe_name = _escape_drive_q_value(name)
@@ -137,30 +186,44 @@ def drive_find_child(service, parent_id: str, name: str, mime_type: Optional[str
         q_parts.append(f"mimeType = '{mime_type}'")
     q = " and ".join(q_parts)
 
-    res = service.files().list(
-        q=q, fields="files(id,name,mimeType,modifiedTime)", pageSize=50, **_list_kwargs()
-    ).execute()
+    res = execute_with_retries(
+        service.files().list(
+            q=q,
+            fields="files(id,name,mimeType,modifiedTime)",
+            pageSize=50,
+            **_kwargs_for_list(),
+        )
+    )
     files = res.get("files", []) or []
     if not files:
         return None
     return sorted(files, key=lambda f: f.get("modifiedTime") or "", reverse=True)[0]
 
-
 def drive_download_file(service, file_id: str, dest_path: Path):
-    request = service.files().get_media(fileId=file_id, **_get_media_kwargs())
+    request = service.files().get_media(fileId=file_id, **_kwargs_for_get_media())
     with io.FileIO(dest_path, "wb") as fh:
         downloader = MediaIoBaseDownload(fh, request, chunksize=1024 * 1024 * 8)
         done = False
         while not done:
-            _, done = downloader.next_chunk()
-
+            try:
+                _, done = downloader.next_chunk()
+            except HttpError as e:
+                status = getattr(e.resp, "status", None)
+                if status in (429, 500, 502, 503, 504):
+                    sleep = 1.0 + random.random()
+                    print(f"[WARN] Download transient HTTP {status}. Retry in {sleep:.1f}s")
+                    time.sleep(sleep)
+                    continue
+                raise
 
 # =========================================================
 # SLOT SELECTION (Option B)
 # =========================================================
 def list_slot_folders(service, slots_parent_id: str) -> List[dict]:
-    return sorted(list(drive_list_children(service, slots_parent_id, FOLDER_MIME)), key=lambda x: x["name"].lower())
-
+    return sorted(
+        list(drive_list_children(service, slots_parent_id, FOLDER_MIME)),
+        key=lambda x: (x.get("name") or "").lower()
+    )
 
 def choose_slot(service, slots_parent_id: str) -> dict:
     slots = list_slot_folders(service, slots_parent_id)
@@ -175,7 +238,6 @@ def choose_slot(service, slots_parent_id: str) -> dict:
             return chosen
         raise RuntimeError(f"SLOT_CHOICE='{SLOT_CHOICE}' out of range (1..{len(slots)}).")
 
-    # interactive fallback
     print("\n" + "=" * 80)
     print("SELECT SLOT TO PROCESS")
     print("=" * 80)
@@ -193,19 +255,16 @@ def choose_slot(service, slots_parent_id: str) -> dict:
                 return slots[idx - 1]
         print(" Invalid choice. Try again.")
 
-
 # =========================================================
 # Excel Parsing Helpers
 # =========================================================
 def _norm_header(s: Any) -> str:
     return re.sub(r"\s+", " ", str(s or "").strip().lower())
 
-
 def _parse_pct(cell_val: Any) -> Optional[float]:
     if cell_val is None:
         return None
     if isinstance(cell_val, (int, float)):
-        # if it's 0.92 maybe? we'll treat <=1.0 as fraction
         v = float(cell_val)
         if 0 <= v <= 1.0:
             return round(v * 100.0, 2)
@@ -229,18 +288,14 @@ def _parse_pct(cell_val: Any) -> Optional[float]:
         return round(v, 2)
     return None
 
-
 def _find_sheet_by_name_like(wb, keywords: List[str]) -> Optional[str]:
-    # returns sheetname if contains any keyword
     for name in wb.sheetnames:
         n = name.lower()
         if any(k in n for k in keywords):
             return name
     return None
 
-
 def _extract_table(ws) -> Tuple[List[str], List[List[Any]]]:
-    # assumes first row is header
     header = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column + 1)]
     header_norm = [_norm_header(h) for h in header]
 
@@ -253,8 +308,9 @@ def _extract_table(ws) -> Tuple[List[str], List[List[Any]]]:
 
     return header_norm, rows
 
-
-def read_deliverables_and_eye_scores_from_xlsx(xlsx_path: Path) -> Tuple[Dict[str, Optional[float]], Dict[str, Optional[float]]]:
+def read_deliverables_and_eye_scores_from_xlsx(
+    xlsx_path: Path
+) -> Tuple[Dict[str, Optional[float]], Dict[str, Optional[float]]]:
     """
     Returns:
       deliverables_avg_by_person: {name: avg_pct or None}
@@ -262,8 +318,7 @@ def read_deliverables_and_eye_scores_from_xlsx(xlsx_path: Path) -> Tuple[Dict[st
     """
     wb = load_workbook(xlsx_path, data_only=True)
 
-    # Deliverables sheet: prefer exact name, else first sheet that has 'deliverables' or 'analysis sheet'
-    deliver_sheet_name = None
+    # Deliverables sheet
     if "Deliverables Analysis Sheet" in wb.sheetnames:
         deliver_sheet_name = "Deliverables Analysis Sheet"
     else:
@@ -272,37 +327,34 @@ def read_deliverables_and_eye_scores_from_xlsx(xlsx_path: Path) -> Tuple[Dict[st
     deliver_ws = wb[deliver_sheet_name]
     d_header, d_rows = _extract_table(deliver_ws)
 
-    # Find columns
     # Person column
-    try:
+    person_idx = None
+    if "person name" in d_header:
         person_idx = d_header.index("person name")
-    except ValueError:
-        # fallback: any header containing "person"
+    else:
         person_idx = next((i for i, h in enumerate(d_header) if "person" in h), None)
     if person_idx is None:
         raise RuntimeError(f"Could not find 'Person Name' column in sheet '{deliver_sheet_name}'.")
 
-    # Average column (deliverables)
+    # Average column
     avg_idx = None
-    # strongest match first
-    for target in ["average % (available)", "average", "avg"]:
-        for i, h in enumerate(d_header):
-            if target == h:
-                avg_idx = i
-                break
+    candidates = [
+        "average % (available)",
+        "average %(available)",
+        "average",
+        "avg",
+    ]
+    for target in candidates:
+        avg_idx = next((i for i, h in enumerate(d_header) if h == target), None)
         if avg_idx is not None:
             break
     if avg_idx is None:
-        # any header containing average
         avg_idx = next((i for i, h in enumerate(d_header) if "average" in h), None)
-
     if avg_idx is None:
         raise RuntimeError(f"Could not find deliverables average column in sheet '{deliver_sheet_name}'.")
 
-    # Eye column maybe on same deliverables sheet
-    eye_idx_in_deliver = next((i for i, h in enumerate(d_header) if "eye" in h and "score" in h), None)
-    if eye_idx_in_deliver is None:
-        eye_idx_in_deliver = next((i for i, h in enumerate(d_header) if "eye" in h), None)
+    # Eye may be in deliverables sheet, but usually it's in a separate "eye ..." sheet
+    eye_idx_in_deliver = next((i for i, h in enumerate(d_header) if "eye" in h), None)
 
     deliverables_avg: Dict[str, Optional[float]] = {}
     eye_avg: Dict[str, Optional[float]] = {}
@@ -315,13 +367,10 @@ def read_deliverables_and_eye_scores_from_xlsx(xlsx_path: Path) -> Tuple[Dict[st
         if eye_idx_in_deliver is not None:
             eye_avg[name] = _parse_pct(row[eye_idx_in_deliver])
 
-    # If we already got eye scores from deliverables sheet and it's populated, good.
-    # Else find separate eye sheet and parse.
+    # If eye not found/populated in deliverables sheet, parse eye sheet
     needs_eye_sheet = True
-    if eye_avg:
-        # check if at least one non-null
-        if any(v is not None for v in eye_avg.values()):
-            needs_eye_sheet = False
+    if eye_avg and any(v is not None for v in eye_avg.values()):
+        needs_eye_sheet = False
 
     if needs_eye_sheet:
         eye_sheet_name = _find_sheet_by_name_like(wb, ["eye"])
@@ -329,22 +378,20 @@ def read_deliverables_and_eye_scores_from_xlsx(xlsx_path: Path) -> Tuple[Dict[st
             eye_ws = wb[eye_sheet_name]
             e_header, e_rows = _extract_table(eye_ws)
 
-            # person col in eye sheet
             e_person_idx = None
             if "person name" in e_header:
                 e_person_idx = e_header.index("person name")
             else:
                 e_person_idx = next((i for i, h in enumerate(e_header) if "person" in h), None)
 
-            # score col in eye sheet
+            # Prefer "Average % (available)" in eye sheet too
             e_score_idx = None
-            # prefer "average" + "eye"
-            e_score_idx = next((i for i, h in enumerate(e_header) if "average" in h and "eye" in h), None)
+            for target in ["average % (available)", "average", "avg"]:
+                e_score_idx = next((i for i, h in enumerate(e_header) if h == target), None)
+                if e_score_idx is not None:
+                    break
             if e_score_idx is None:
-                e_score_idx = next((i for i, h in enumerate(e_header) if "eye" in h and ("score" in h or "average" in h)), None)
-            if e_score_idx is None:
-                # last resort: any header containing score or average
-                e_score_idx = next((i for i, h in enumerate(e_header) if "score" in h or "average" in h), None)
+                e_score_idx = next((i for i, h in enumerate(e_header) if "average" in h or "score" in h), None)
 
             if e_person_idx is not None and e_score_idx is not None:
                 for row in e_rows:
@@ -355,16 +402,13 @@ def read_deliverables_and_eye_scores_from_xlsx(xlsx_path: Path) -> Tuple[Dict[st
 
     return deliverables_avg, eye_avg
 
-
 # =========================================================
 # Printing (Table)
 # =========================================================
 def _pct(v: Optional[float]) -> str:
     return "-" if v is None else f"{v:.2f}%"
 
-
 def print_table(rows: List[Tuple[str, Optional[float], Optional[float]]], *, title: str):
-    # widths
     rank_w = 4
     name_w = max(len("Person Name"), *(len(r[0]) for r in rows)) if rows else len("Person Name")
     del_w = max(len("Deliverables Avg"), *(len(_pct(r[1])) for r in rows)) if rows else len("Deliverables Avg")
@@ -376,19 +420,11 @@ def print_table(rows: List[Tuple[str, Optional[float], Optional[float]]], *, tit
     for i, (name, d, e) in enumerate(rows, start=1):
         print(f"{i:<{rank_w}}  {name:<{name_w}}  {_pct(d):<{del_w}}  {_pct(e):<{eye_w}}")
 
-
 def combined_rank_score(d: Optional[float], e: Optional[float]) -> float:
-    """
-    Rank by "both score":
-      - If both exist: average of the two
-      - If one exists: that one
-      - If none: very low
-    """
-    vals = [v for v in [d, e] if isinstance(v, (int, float))]
+    vals = [v for v in (d, e) if isinstance(v, (int, float))]
     if not vals:
         return -1e9
     return sum(vals) / len(vals)
-
 
 # =========================================================
 # MAIN
@@ -396,13 +432,13 @@ def combined_rank_score(d: Optional[float], e: Optional[float]) -> float:
 def main():
     service = get_drive_service()
 
-    # Find 2026
+    # Find SOURCE root (2025)
     candidates = drive_search_folder_anywhere(service, ROOT_2026_FOLDER_NAME)
     if not candidates:
         raise RuntimeError(f"Could not find folder '{ROOT_2026_FOLDER_NAME}' anywhere in Drive.")
     base_2026 = pick_best_named_folder(candidates)
 
-    # Find Candidate Result
+    # Find OUTPUT root (Candidate Result2)
     out_candidates = drive_search_folder_anywhere(service, OUTPUT_ROOT_FOLDER_NAME)
     if not out_candidates:
         raise RuntimeError(
@@ -410,23 +446,20 @@ def main():
         )
     output_root = pick_best_named_folder(out_candidates)
 
-    # Choose slot (Option B)
+    # Choose slot
     slot = choose_slot(service, base_2026["id"])
     slot_name = slot["name"]
-
     print(f"\n=== SLOT: {slot_name} ===")
 
-    # Candidate Result/<Slot>
+    # Candidate Result2/<Slot>
     slot_out_folder = drive_find_child(service, output_root["id"], slot_name, FOLDER_MIME)
     if not slot_out_folder:
         raise RuntimeError(f"Slot folder not found in '{OUTPUT_ROOT_FOLDER_NAME}': {slot_name}")
 
-    # XLSX
+    # XLSX file inside slot folder
     xlsx_file = drive_find_child(service, slot_out_folder["id"], OUTPUT_XLSX_NAME, None)
     if not xlsx_file:
-        raise RuntimeError(
-            f"Excel not found: {OUTPUT_ROOT_FOLDER_NAME}/{slot_name}/{OUTPUT_XLSX_NAME}"
-        )
+        raise RuntimeError(f"Excel not found: {OUTPUT_ROOT_FOLDER_NAME}/{slot_name}/{OUTPUT_XLSX_NAME}")
 
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
@@ -435,27 +468,23 @@ def main():
 
         deliverables_avg, eye_avg = read_deliverables_and_eye_scores_from_xlsx(local_xlsx)
 
-    # Build unified row list (include people from deliverables sheet first)
     all_people = sorted(set(deliverables_avg.keys()) | set(eye_avg.keys()), key=lambda s: s.lower())
 
     rows_all: List[Tuple[str, Optional[float], Optional[float]]] = []
     for p in all_people:
         rows_all.append((p, deliverables_avg.get(p), eye_avg.get(p)))
 
-    # Print as requested format line-by-line
-    # Person Name --> Deliverables Average | Eye Moments Score
+    # Exact requested line output
     print("\nPerson Name --> Deliverables Average | Eye Moments Score")
     for name, d, e in rows_all:
         print(f"{name} --> {_pct(d)} | {_pct(e)}")
 
-    # Filtered (above thresholds)
+    # Filter by thresholds
     rows_filtered = [
         (n, d, e)
         for (n, d, e) in rows_all
         if (d is not None and d >= MIN_DELIVERABLES) and (e is not None and e >= MIN_EYE)
     ]
-
-    # Sort filtered by combined score desc
     rows_filtered.sort(key=lambda r: combined_rank_score(r[1], r[2]), reverse=True)
 
     print_table(
@@ -463,7 +492,7 @@ def main():
         title=f"FILTERED (Deliverables >= {MIN_DELIVERABLES:.0f}% AND Eye >= {MIN_EYE:.0f}%)",
     )
 
-    # Top N from filtered; if filtered empty, fallback to best overall combined
+    # Top N
     if rows_filtered:
         top_rows = rows_filtered[:TOP_N]
     else:

@@ -5,27 +5,27 @@ Drive-integrated Candidate Eye/Face Tracking (slot-based)
 
 NON-INTERACTIVE UPDATE (Option B):
 If SLOT_CHOICE is set (e.g., SLOT_CHOICE=2), script auto-picks that slot.
-   If not set, it shows interactive slot menu.
+If not set, it shows interactive slot menu.
 
 STRICT REF MATCH BEHAVIOR:
 If REF_SIM is '-' (no match) OR REF_SIM < ref_min_sim, treat as TRAINER:
-   - Do NOT track / do NOT compute gaze / do NOT run FaceMesh / do NOT draw mesh for that frame.
-   - Only track when matched candidate is found (REF_SIM >= ref_min_sim).
-   - If no reference image exists, fallback logic still applies (candidate_side/largest-face).
+  - Do NOT track / do NOT compute gaze / do NOT run FaceMesh / do NOT draw mesh for that frame.
+  - Only track when matched candidate is found (REF_SIM >= ref_min_sim).
+  - If no reference image exists, fallback logic still applies (candidate_side/largest-face).
 
 Do NOT upload these to Drive:
-   - __EYE_summary.json
-   - __EYE_metrics.csv
+  - __EYE_summary.json
+  - __EYE_metrics.csv
 
 Do NOT re-process generated outputs (any file containing '__EYE_').
 
 We still upload:
-- __EYE_result.json
-- annotated video (if enabled)
+  - __EYE_result.json
+  - annotated video (if enabled)
 
 Retry behavior:
 If a video fails (e.g., BrokenPipeError), retry the SAME video again (not exit)
-   up to MAX_VIDEO_RETRIES (env) with backoff.
+up to MAX_VIDEO_RETRIES (env) with backoff.
 
 Install:
   pip install opencv-python mediapipe numpy pandas python-dotenv openai insightface onnxruntime
@@ -39,6 +39,9 @@ Requires:
 Run:
   python drive_eye_tracker.py --candidate_side auto
   SLOT_CHOICE=2 python drive_eye_tracker.py --candidate_side right
+
+SERVER/DOCKER AUTH:
+  HEADLESS_AUTH=1 python drive_eye_tracker.py ...
 """
 
 import os
@@ -85,6 +88,9 @@ SLOT_CHOICE = (os.getenv("SLOT_CHOICE") or "").strip()  # e.g. "2"
 USE_SHARED_DRIVES = (os.getenv("USE_SHARED_DRIVES") or "").strip().lower() in ("1", "true", "yes", "y")
 DEFAULT_OPENAI_MODEL = (os.getenv("OPENAI_MODEL") or "").strip() or "gpt-5"
 
+# Headless auth (server/docker): prints URL, paste code in terminal
+HEADLESS_AUTH = (os.getenv("HEADLESS_AUTH") or "").strip().lower() in ("1", "true", "yes", "y")
+
 
 # =========================
 # VIDEO RETRIES (per video)
@@ -95,7 +101,6 @@ VIDEO_RETRY_BASE_SLEEP = float((os.getenv("VIDEO_RETRY_BASE_SLEEP") or "5").stri
 def is_retryable_video_error(e: Exception) -> bool:
     if isinstance(e, (BrokenPipeError, ConnectionError, TimeoutError)):
         return True
-
     msg = f"{type(e).__name__}: {e}".lower()
     retry_keywords = [
         "broken pipe",
@@ -180,13 +185,27 @@ def execute_with_retries(request, *, max_retries: int = 8, base_sleep: float = 1
             raise
 
 
-def _list_kwargs():
+# =========================
+# Shared Drives kwargs (SAFE per method)
+# =========================
+def _kwargs_for_list() -> Dict[str, Any]:
+    # ONLY for files().list()
     if USE_SHARED_DRIVES:
-        return {"supportsAllDrives": True, "includeItemsFromAllDrives": True}
+        return {
+            "supportsAllDrives": True,
+            "includeItemsFromAllDrives": True,
+            "corpora": "allDrives",
+        }
     return {}
 
+def _kwargs_for_mutation() -> Dict[str, Any]:
+    # create/update/delete/permissions
+    if USE_SHARED_DRIVES:
+        return {"supportsAllDrives": True}
+    return {}
 
-def _get_media_kwargs():
+def _get_media_kwargs() -> Dict[str, Any]:
+    # get_media/export_media
     if USE_SHARED_DRIVES:
         return {"supportsAllDrives": True}
     return {}
@@ -196,20 +215,38 @@ def _get_media_kwargs():
 # Google Drive Auth
 # =========================
 def get_drive_service():
-    creds = None
+    creds: Optional[Credentials] = None
+
     if TOKEN_FILE.exists():
         creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
 
+    # If token exists but scopes changed, refresh can fail → force reauth
+    if creds and set(creds.scopes or []) != set(SCOPES):
+        print("[AUTH] token.json scopes mismatch. Deleting token.json and re-authenticating...")
+        TOKEN_FILE.unlink(missing_ok=True)
+        creds = None
+
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
+            try:
+                creds.refresh(Request())
+            except Exception as e:
+                print(f"[AUTH] Refresh failed ({e}). Re-authenticating...")
+                TOKEN_FILE.unlink(missing_ok=True)
+                creds = None
+
+        if not creds or not creds.valid:
             if not CREDENTIALS_FILE.exists():
                 raise FileNotFoundError("credentials.json not found next to this script.")
             flow = InstalledAppFlow.from_client_secrets_file(str(CREDENTIALS_FILE), SCOPES)
-            # NOTE: In Docker/headless you may want flow.run_console()
-            creds = flow.run_local_server(port=0)
-        TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
+
+            # Headless-safe auth
+            if HEADLESS_AUTH or not os.environ.get("DISPLAY"):
+                creds = flow.run_console()
+            else:
+                creds = flow.run_local_server(port=0)
+
+            TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
 
     return build("drive", "v3", credentials=creds)
 
@@ -218,14 +255,20 @@ def get_drive_service():
 # Drive Helpers
 # =========================
 def _escape_drive_q_value(s: str) -> str:
-    return s.replace("'", "''")
+    """
+    Drive query string values:
+      - escape backslash first
+      - escape single quote as \'
+    This fixes folders like: Jahnvi' Team
+    """
+    return s.replace("\\", "\\\\").replace("'", "\\'")
 
 
 def drive_search_folder_anywhere(service, folder_name: str) -> List[dict]:
     safe = _escape_drive_q_value(folder_name)
     q = f"name = '{safe}' and mimeType = '{FOLDER_MIME}' and trashed=false"
 
-    out = []
+    out: List[dict] = []
     page_token = None
     while True:
         res = execute_with_retries(
@@ -234,7 +277,7 @@ def drive_search_folder_anywhere(service, folder_name: str) -> List[dict]:
                 fields="nextPageToken, files(id,name,parents,modifiedTime)",
                 pageSize=1000,
                 pageToken=page_token,
-                **_list_kwargs(),
+                **_kwargs_for_list(),
             )
         )
         out.extend(res.get("files", []))
@@ -262,7 +305,7 @@ def drive_list_children(service, parent_id: str, mime_type: Optional[str] = None
                 fields="nextPageToken, files(id,name,mimeType,modifiedTime,size)",
                 pageSize=1000,
                 pageToken=page_token,
-                **_list_kwargs(),
+                **_kwargs_for_list(),
             )
         )
         for f in res.get("files", []):
@@ -284,7 +327,7 @@ def drive_find_child(service, parent_id: str, name: str, mime_type: Optional[str
             q=q,
             fields="files(id,name,mimeType,parents,modifiedTime)",
             pageSize=50,
-            **_list_kwargs(),
+            **_kwargs_for_list(),
         )
     )
     files = res.get("files", []) or []
@@ -312,6 +355,10 @@ def drive_download_file(service, file_id: str, dest_path: Path):
 
 
 def drive_upload_file(service, parent_id: str, drive_filename: str, local_path: Path, mime_type: str):
+    """
+    Upload (create/update) file into parent folder.
+    IMPORTANT: use mutation kwargs (supportsAllDrives only), not list kwargs.
+    """
     existing = drive_find_child(service, parent_id, drive_filename, None)
     media = MediaFileUpload(str(local_path), mimetype=mime_type, resumable=True)
 
@@ -320,7 +367,7 @@ def drive_upload_file(service, parent_id: str, drive_filename: str, local_path: 
             service.files().update(
                 fileId=existing["id"],
                 media_body=media,
-                **_list_kwargs(),
+                **_kwargs_for_mutation(),
             )
         )
         return existing["id"]
@@ -331,7 +378,7 @@ def drive_upload_file(service, parent_id: str, drive_filename: str, local_path: 
                 body=meta,
                 media_body=media,
                 fields="id",
-                **_list_kwargs(),
+                **_kwargs_for_mutation(),
             )
         )
         return created["id"]
@@ -679,7 +726,6 @@ def pick_candidate_face_bbox(
     x1, y1, x2, y2 = best.bbox.astype(int).tolist()
     bbox = (x1, y1, x2, y2)
 
-    # below threshold => treat as no match, but still return best_sim for debug overlay
     if best_sim < min_sim:
         return None, best_sim
 
@@ -713,7 +759,7 @@ def pick_facemesh_face(
     if not faces:
         return None
 
-    # If we have a preferred bbox (from ref match), pick the closest face to that bbox center
+    # Preferred bbox (from ref match)
     if prefer_bbox is not None:
         bx1, by1, bx2, by2 = prefer_bbox
         bcx = (bx1 + bx2) / 2.0
@@ -909,6 +955,7 @@ def rate_with_openai(summary_payload: Dict[str, Any], model: str = DEFAULT_OPENA
         },
     }
 
+    # Responses API (newer) then fallback
     try:
         resp = client.responses.create(
             model=model,
@@ -916,7 +963,7 @@ def rate_with_openai(summary_payload: Dict[str, Any], model: str = DEFAULT_OPENA
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content},
             ],
-            response_format={"type": "json_schema", "json_schema": schema},
+            text={"format": {"type": "json_schema", "json_schema": schema}},
             temperature=0,
         )
         return parse_json_strict(resp.output_text)
@@ -1033,7 +1080,6 @@ def track_one_video(
 
     writer = None
 
-    # Optional: expire stale ref match so we don't "ghost track"
     last_good_match_frame: Optional[int] = None
     MAX_STALE_FRAMES = max(1, match_every_n * 3)
 
@@ -1071,22 +1117,22 @@ def track_one_video(
 
             t = frame_idx / fps
 
-            # Run ref-match every N frames (and keep cached bbox between checks)
+            # Ref match
             if ref_emb is not None and match_every_n > 0 and (frame_idx % match_every_n == 0):
                 bbox, sim = pick_candidate_face_bbox(face_app, frame, ref_emb, min_sim=ref_min_sim)
                 cached_bbox = bbox
-                cached_sim = sim  # None if no faces, float if faces (even below threshold)
+                cached_sim = sim
                 if bbox is not None:
                     last_good_match_frame = frame_idx
 
-            # Expire stale match to avoid ghost tracking
+            # Expire stale match
             if ref_emb is not None and last_good_match_frame is not None:
                 if (frame_idx - last_good_match_frame) > MAX_STALE_FRAMES:
                     cached_bbox = None
                     cached_sim = None
                     last_good_match_frame = None
 
-            # ✅ STRICT: trainer frame if no accepted ref match OR sim unknown/low
+            # STRICT: treat trainer if no accepted match
             force_no_face_this_frame = False
             if STRICT_REF_ONLY and ref_emb is not None:
                 if (cached_bbox is None) or (cached_sim is None) or (cached_sim < ref_min_sim):
@@ -1103,7 +1149,7 @@ def track_one_video(
             lc = rc = None
             le_box = re_box = None
 
-            # ✅ Do NOT run FaceMesh at all on trainer frames
+            # Do NOT run FaceMesh at all on trainer frames
             res = None
             if not force_no_face_this_frame:
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -1210,7 +1256,7 @@ def track_one_video(
                     )
                     mouth_open = float(mouth_gap / (eye_span + 1e-6))
 
-            # ✅ If trainer frame, do NOT update smoothing history/hysteresis
+            # If trainer frame, do NOT update smoothing history/hysteresis
             if not force_no_face_this_frame:
                 hist.append(raw)
                 proposed = majority_vote(hist)
@@ -1234,7 +1280,6 @@ def track_one_video(
                     x = max(int((w - tw) / 2), 10)
                     put_text_with_bg(frame, label, (x, 40), font_scale=1.0, thickness=2)
 
-                # REF_SIM overlay: show '-' if None
                 if ref_emb is not None:
                     if cached_sim is None:
                         put_text_with_bg(frame, "REF_SIM: -", (10, h - 20), font_scale=0.8, thickness=2)
@@ -1267,9 +1312,7 @@ def track_one_video(
         writer.release()
 
     df = pd.DataFrame(rows)
-
-    # Write locally (temp). DO NOT upload.
-    df.to_csv(out_csv, index=False)
+    df.to_csv(out_csv, index=False)  # local-only
 
     if cfg.write_annotated_video:
         if not out_annot_tmp_mp4.exists():
@@ -1397,6 +1440,8 @@ def main():
     print(f"VIDEO RETRIES: MAX_VIDEO_RETRIES={MAX_VIDEO_RETRIES} base_sleep={VIDEO_RETRY_BASE_SLEEP}s")
     if SLOT_CHOICE:
         print(f"AUTO SLOT_CHOICE={SLOT_CHOICE}")
+    if HEADLESS_AUTH:
+        print("HEADLESS_AUTH=1 (console OAuth)")
     print("=" * 100)
 
     for person in people:
@@ -1507,7 +1552,7 @@ def main():
                                 drive_upload_file(service, deliverable_id, out_result_name, local_result, "application/json")
 
                                 print("      [OK  ] done")
-                                break  # ✅ success
+                                break
 
                             except Exception as e:
                                 retryable = is_retryable_video_error(e)

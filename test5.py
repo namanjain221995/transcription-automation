@@ -27,15 +27,12 @@ from openai import OpenAI
 # =========================
 load_dotenv()
 
-# Non-interactive slot selection (Option B)
-# Example: SLOT_CHOICE=2
 SLOT_CHOICE = (os.getenv("SLOT_CHOICE") or "").strip()
-
-# Shared drives flag from env (optional)
 USE_SHARED_DRIVES = (os.getenv("USE_SHARED_DRIVES") or "").strip().lower() in ("1", "true", "yes", "y")
-
-# OpenAI model override (optional)
 DEFAULT_OPENAI_MODEL = (os.getenv("OPENAI_MODEL") or "").strip() or "gpt-5.2-mini"
+
+# Headless auth for servers/docker (copy/paste code)
+HEADLESS_AUTH = (os.getenv("HEADLESS_AUTH") or "").strip().lower() in ("1", "true", "yes", "y")
 
 # =========================
 # CONFIG
@@ -44,81 +41,54 @@ SCOPES = ["https://www.googleapis.com/auth/drive"]
 CREDENTIALS_FILE = Path("credentials.json")
 TOKEN_FILE = Path("token.json")
 
-# SOURCE: read slots + people from here
-ROOT_2026_FOLDER_NAME = "2025"
-
-# DESTINATION: must exist anywhere in Drive. Script will NOT create it.
-OUTPUT_ROOT_FOLDER_NAME = "Candidate Result2"
+ROOT_SLOTS_FOLDER_NAME = "2025"          # SOURCE root (contains slot folders)
+OUTPUT_ROOT_FOLDER_NAME = "Candidate Result2"  # DEST root (must exist)
 
 FOLDER_MIME = "application/vnd.google-apps.folder"
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
-# Deliverable folders (NO "1. Format")
 FOLDER_NAMES = [
     "3. Introduction Video",
     "5. Project Scenarios",
     "8. Tools & Technology Videos",
 ]
 
-# Skip these "person" folders under slot
 SKIP_PERSON_FOLDERS = {"1. Format"}
-
-# Skip these deliverable folders if they appear under person
 SKIP_DELIVERABLE_FOLDERS = {"1. Format"}
 
-# LLM output names with or without ".txt"
 LLM_OUTPUT_FILE_RE = re.compile(r"^LLM_OUTPUT__.*(\.txt)?$", re.I)
 
-# Score formats supported:
-# - Final Overall Score: 8/10
-# - Final Overall Score: 8.5 out of 10
-# - Final Overall Score: 60%
-# - Final Overall Score: FAIL (30%)
-# - Final Overall Score: PASS (80%)
 FAIL_PASS_PCT_RX = re.compile(
     r"final\s*overall\s*score\s*[:\-]\s*(pass|fail)\s*(?:\(\s*([0-9]+(?:\.[0-9]+)?)\s*%\s*\)|[:\-]?\s*([0-9]+(?:\.[0-9]+)?)\s*%?)",
     re.I,
 )
 
 SCORE_REGEXES = [
-    re.compile(
-        r"final\s*overall\s*score\s*[:\-]\s*([0-9]+(?:\.[0-9]+)?)\s*(/10|\/\s*10|out\s*of\s*10|%)?",
-        re.I,
-    ),
-    re.compile(
-        r"final\s*score\s*[:\-]\s*([0-9]+(?:\.[0-9]+)?)\s*(/10|\/\s*10|out\s*of\s*10|%)?",
-        re.I,
-    ),
+    re.compile(r"final\s*overall\s*score\s*[:\-]\s*([0-9]+(?:\.[0-9]+)?)\s*(/10|\/\s*10|out\s*of\s*10|%)?", re.I),
+    re.compile(r"final\s*score\s*[:\-]\s*([0-9]+(?:\.[0-9]+)?)\s*(/10|\/\s*10|out\s*of\s*10|%)?", re.I),
 ]
 
 MAX_CHARS_TO_MODEL = 80_000
-
-# Percent output clamp
 PCT_MIN = 0.0
 PCT_MAX = 100.0
 
 SLEEP_BETWEEN_UPLOADS_SEC = 0.25
-
-# Exact Drive file name you want (same for every slot)
 OUTPUT_XLSX_NAME = "Deliverables Analysis Sheet.xlsx"
 
-# Give editor access to these emails (folder + xlsx)
 EDITOR_EMAILS = [
     "rajvi.patel@techsarasolutions.com",
     "sahil.patel@techsarasolutions.com",
     "soham.piprotar@techsarasolutions.com",
 ]
 
-
 # =========================
-# ENV + OpenAI
+# OpenAI
 # =========================
 def init_openai_client() -> OpenAI:
     api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY not found in .env or environment variables.")
     return OpenAI(api_key=api_key)
-
 
 # =========================
 # Drive auth
@@ -128,7 +98,6 @@ def get_drive_service():
     if TOKEN_FILE.exists():
         creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
 
-    # If token exists but scopes changed, refresh will fail. Force new login.
     if creds and set(creds.scopes or []) != set(SCOPES):
         print("[AUTH] token.json scopes mismatch. Deleting token.json and re-authenticating...")
         TOKEN_FILE.unlink(missing_ok=True)
@@ -147,14 +116,22 @@ def get_drive_service():
             if not CREDENTIALS_FILE.exists():
                 raise FileNotFoundError("credentials.json not found next to this script.")
             flow = InstalledAppFlow.from_client_secrets_file(str(CREDENTIALS_FILE), SCOPES)
-            # NOTE: In Docker/headless you may want flow.run_console()
-            creds = flow.run_local_server(port=0)
+
+            # Server/Docker safe: copy/paste auth code
+            if HEADLESS_AUTH or not os.environ.get("DISPLAY"):
+                creds = flow.run_console()
+            else:
+                creds = flow.run_local_server(port=0)
+
             TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
 
     return build("drive", "v3", credentials=creds)
 
-
-def _list_kwargs():
+# =========================
+# Shared Drives kwargs (SAFE per method)
+# =========================
+def _kwargs_for_list() -> Dict[str, Any]:
+    # ONLY for files().list()
     if USE_SHARED_DRIVES:
         return {
             "supportsAllDrives": True,
@@ -163,19 +140,24 @@ def _list_kwargs():
         }
     return {}
 
-
-def _get_media_kwargs():
+def _kwargs_for_mutation() -> Dict[str, Any]:
+    # for create/update/delete/permissions
     if USE_SHARED_DRIVES:
         return {"supportsAllDrives": True}
     return {}
 
+def _get_media_kwargs() -> Dict[str, Any]:
+    # get_media / export_media
+    if USE_SHARED_DRIVES:
+        return {"supportsAllDrives": True}
+    return {}
 
 # =========================
 # Drive helpers
 # =========================
 def _escape_drive_q_value(s: str) -> str:
-    return s.replace("'", "''")
-
+    # Drive v3 query strings: escape backslash first, then single quote
+    return s.replace("\\", "\\\\").replace("'", "\\'")
 
 def drive_list_children(service, parent_id: str, mime_type: Optional[str] = None):
     q_parts = [f"'{parent_id}' in parents", "trashed = false"]
@@ -192,7 +174,7 @@ def drive_list_children(service, parent_id: str, mime_type: Optional[str] = None
                 fields="nextPageToken, files(id,name,mimeType,modifiedTime,size)",
                 pageSize=1000,
                 pageToken=page_token,
-                **_list_kwargs(),
+                **_kwargs_for_list(),
             )
             .execute()
         )
@@ -201,7 +183,6 @@ def drive_list_children(service, parent_id: str, mime_type: Optional[str] = None
         page_token = res.get("nextPageToken")
         if not page_token:
             break
-
 
 def drive_find_child(service, parent_id: str, name: str, mime_type: Optional[str] = None) -> Optional[dict]:
     safe = _escape_drive_q_value(name)
@@ -216,7 +197,7 @@ def drive_find_child(service, parent_id: str, name: str, mime_type: Optional[str
             q=q,
             fields="files(id,name,mimeType,parents,modifiedTime)",
             pageSize=50,
-            **_list_kwargs(),
+            **_kwargs_for_list(),
         )
         .execute()
     )
@@ -225,12 +206,10 @@ def drive_find_child(service, parent_id: str, name: str, mime_type: Optional[str
         return None
     return sorted(files, key=lambda f: f.get("modifiedTime") or "", reverse=True)[0]
 
-
 def drive_create_folder(service, parent_id: str, name: str) -> str:
     meta = {"name": name, "mimeType": FOLDER_MIME, "parents": [parent_id]}
-    created = service.files().create(body=meta, fields="id", **_list_kwargs()).execute()
+    created = service.files().create(body=meta, fields="id", **_kwargs_for_mutation()).execute()
     return created["id"]
-
 
 def drive_download_text(service, file_id: str, mime_type: Optional[str]) -> str:
     fh = io.BytesIO()
@@ -255,12 +234,7 @@ def drive_download_text(service, file_id: str, mime_type: Optional[str]) -> str:
     except Exception:
         return raw.decode("latin-1", errors="ignore")
 
-
 def drive_upload_xlsx(service, parent_id: str, filename: str, local_path: Path) -> str:
-    """
-    Uploads (create or update) filename inside parent_id.
-    Returns the Drive fileId.
-    """
     existing = None
     for f in drive_list_children(service, parent_id, None):
         if f.get("name") == filename and f.get("mimeType") != FOLDER_MIME:
@@ -270,13 +244,12 @@ def drive_upload_xlsx(service, parent_id: str, filename: str, local_path: Path) 
     media = MediaFileUpload(str(local_path), mimetype=XLSX_MIME, resumable=True)
 
     if existing:
-        service.files().update(fileId=existing["id"], media_body=media, **_list_kwargs()).execute()
+        service.files().update(fileId=existing["id"], media_body=media, **_kwargs_for_mutation()).execute()
         return existing["id"]
     else:
         meta = {"name": filename, "parents": [parent_id]}
-        created = service.files().create(body=meta, media_body=media, fields="id", **_list_kwargs()).execute()
+        created = service.files().create(body=meta, media_body=media, fields="id", **_kwargs_for_mutation()).execute()
         return created["id"]
-
 
 def drive_search_folder_anywhere(service, folder_name: str) -> List[dict]:
     safe_name = _escape_drive_q_value(folder_name)
@@ -287,16 +260,14 @@ def drive_search_folder_anywhere(service, folder_name: str) -> List[dict]:
             q=q,
             fields="files(id,name,parents,modifiedTime)",
             pageSize=200,
-            **_list_kwargs(),
+            **_kwargs_for_list(),
         )
         .execute()
     )
     return res.get("files", []) or []
 
-
 def pick_best_named_folder(candidates: List[dict]) -> dict:
     return sorted(candidates, key=lambda c: (c.get("modifiedTime") or ""), reverse=True)[0]
-
 
 def drive_grant_editor_access(service, file_id: str, emails: List[str]):
     for email in emails:
@@ -306,7 +277,7 @@ def drive_grant_editor_access(service, file_id: str, emails: List[str]):
                 fileId=file_id,
                 body=perm,
                 sendNotificationEmail=False,
-                **_list_kwargs(),
+                **_kwargs_for_mutation(),
             ).execute()
             print(f"  [PERM] Editor added: {email}")
         except HttpError as e:
@@ -316,9 +287,8 @@ def drive_grant_editor_access(service, file_id: str, emails: List[str]):
             else:
                 print(f"  [PERM] Failed for {email}: {e}")
 
-
 # =========================
-# SLOT SELECTION (supports SLOT_CHOICE env)
+# SLOT SELECTION
 # =========================
 def list_slot_folders(service, slots_parent_id: str) -> List[dict]:
     return sorted(
@@ -326,11 +296,10 @@ def list_slot_folders(service, slots_parent_id: str) -> List[dict]:
         key=lambda x: (x.get("name") or "").lower(),
     )
 
-
 def choose_slot(service, slots_parent_id: str) -> dict:
     slots = list_slot_folders(service, slots_parent_id)
     if not slots:
-        raise RuntimeError("No slot folders found under 2026.")
+        raise RuntimeError(f"No slot folders found under '{ROOT_SLOTS_FOLDER_NAME}'.")
 
     if SLOT_CHOICE.isdigit():
         idx = int(SLOT_CHOICE)
@@ -340,11 +309,9 @@ def choose_slot(service, slots_parent_id: str) -> dict:
             return chosen
         raise RuntimeError(f"SLOT_CHOICE='{SLOT_CHOICE}' out of range (1..{len(slots)}).")
 
-    # interactive fallback
     print("\n" + "=" * 80)
     print("SELECT SLOT TO PROCESS")
     print("=" * 80)
-
     for i, s in enumerate(slots, start=1):
         print(f"  {i:2}. {s['name']}")
     print("  EXIT - Exit\n")
@@ -359,7 +326,6 @@ def choose_slot(service, slots_parent_id: str) -> dict:
                 return slots[idx - 1]
         print("Invalid choice. Try again.")
 
-
 # =========================
 # Score extraction -> PERCENT
 # =========================
@@ -370,13 +336,11 @@ def clamp_pct(x: Optional[float]) -> Optional[float]:
         return None
     return x
 
-
 def normalize_to_percent(value: float, unit: Optional[str]) -> Optional[float]:
     u = (unit or "").lower().strip()
 
     if "%" in u:
         return value
-
     if "/10" in u or "out of 10" in u:
         return value * 10.0
 
@@ -385,9 +349,7 @@ def normalize_to_percent(value: float, unit: Optional[str]) -> Optional[float]:
         return value * 10.0
     if 10.0 < value <= 100.0:
         return value
-
     return None
-
 
 def extract_score_regex_percent(text: str) -> Optional[float]:
     if not text:
@@ -413,7 +375,6 @@ def extract_score_regex_percent(text: str) -> Optional[float]:
                 return None
 
     return None
-
 
 def extract_score_openai_percent(client: OpenAI, text: str) -> Optional[float]:
     if not text:
@@ -479,7 +440,6 @@ def extract_score_openai_percent(client: OpenAI, text: str) -> Optional[float]:
     pct = normalize_to_percent(val, unit_hint)
     return clamp_pct(round(pct, 2)) if pct is not None else None
 
-
 def pick_best_score_from_llm_outputs_percent(
     service,
     openai_client: OpenAI,
@@ -492,7 +452,6 @@ def pick_best_score_from_llm_outputs_percent(
     if not llm_files:
         return None, None
 
-    # newest first
     llm_files.sort(key=lambda x: (x.get("modifiedTime") or ""), reverse=True)
 
     for f in llm_files:
@@ -508,9 +467,8 @@ def pick_best_score_from_llm_outputs_percent(
 
     return None, None
 
-
 # =========================
-# Excel creation (PERCENT as text "60%")
+# Excel creation
 # =========================
 def autosize_columns(ws):
     for col in ws.columns:
@@ -520,7 +478,6 @@ def autosize_columns(ws):
             v = "" if cell.value is None else str(cell.value)
             max_len = max(max_len, len(v))
         ws.column_dimensions[col_letter].width = min(max(12, max_len + 2), 60)
-
 
 def build_slot_workbook_percent(rows: List[Dict[str, Any]]) -> Workbook:
     wb = Workbook()
@@ -552,7 +509,6 @@ def build_slot_workbook_percent(rows: List[Dict[str, Any]]) -> Workbook:
     autosize_columns(ws)
     return wb
 
-
 # =========================
 # MAIN
 # =========================
@@ -560,31 +516,26 @@ def main():
     openai_client = init_openai_client()
     service = get_drive_service()
 
-    # --- Find SOURCE 2026 folder (contains slots) ---
-    candidates_2026 = drive_search_folder_anywhere(service, ROOT_2026_FOLDER_NAME)
-    if not candidates_2026:
-        raise RuntimeError(f"Could not find folder '{ROOT_2026_FOLDER_NAME}' anywhere in Drive.")
-    base_2026 = pick_best_named_folder(candidates_2026)
-    slots_parent_id = base_2026["id"]
+    candidates_root = drive_search_folder_anywhere(service, ROOT_SLOTS_FOLDER_NAME)
+    if not candidates_root:
+        raise RuntimeError(f"Could not find folder '{ROOT_SLOTS_FOLDER_NAME}' anywhere in Drive.")
+    base_root = pick_best_named_folder(candidates_root)
+    slots_parent_id = base_root["id"]
 
-    # --- Find OUTPUT ROOT folder in Drive (Candidate Result) ---
     candidates_out = drive_search_folder_anywhere(service, OUTPUT_ROOT_FOLDER_NAME)
     if not candidates_out:
         raise RuntimeError(
-            f"Could not find output folder '{OUTPUT_ROOT_FOLDER_NAME}' anywhere in Drive. "
-            f"Create it and run again."
+            f"Could not find output folder '{OUTPUT_ROOT_FOLDER_NAME}' anywhere in Drive. Create it and run again."
         )
     output_root = pick_best_named_folder(candidates_out)
     output_root_id = output_root["id"]
 
-    # --- Choose which slot to process (AUTO if SLOT_CHOICE provided) ---
     slot = choose_slot(service, slots_parent_id)
     slot_name = slot["name"]
     slot_id = slot["id"]
 
     print(f"\n=== SLOT (SOURCE): {slot_name} ===")
 
-    # --- Create/Use per-slot output folder under Candidate Result ---
     slot_out = drive_find_child(service, output_root_id, slot_name, FOLDER_MIME)
     if not slot_out:
         slot_out_id = drive_create_folder(service, output_root_id, slot_name)
@@ -592,11 +543,9 @@ def main():
     else:
         slot_out_id = slot_out["id"]
 
-    # Give editor access on the per-slot output folder
     print("[PERM] Setting folder editors...")
     drive_grant_editor_access(service, slot_out_id, EDITOR_EMAILS)
 
-    # --- Read people folders from SOURCE slot folder 2026/<SlotName>/ ---
     people_all = sorted(
         list(drive_list_children(service, slot_id, FOLDER_MIME)),
         key=lambda x: (x.get("name") or "").lower(),
@@ -637,23 +586,18 @@ def main():
 
     wb = build_slot_workbook_percent(slot_rows)
 
-    out_name = OUTPUT_XLSX_NAME
-
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
-        local_xlsx = td / out_name
+        local_xlsx = td / OUTPUT_XLSX_NAME
         wb.save(local_xlsx)
 
-        # Upload into: Drive / Candidate Result / <SlotName> /
-        uploaded_file_id = drive_upload_xlsx(service, slot_out_id, out_name, local_xlsx)
-        print(f"[OK] Uploaded: {OUTPUT_ROOT_FOLDER_NAME}/{slot_name}/{out_name}")
+        uploaded_file_id = drive_upload_xlsx(service, slot_out_id, OUTPUT_XLSX_NAME, local_xlsx)
+        print(f"[OK] Uploaded: {OUTPUT_ROOT_FOLDER_NAME}/{slot_name}/{OUTPUT_XLSX_NAME}")
 
-        # Give editor access on the sheet
         print("[PERM] Setting sheet editors...")
         drive_grant_editor_access(service, uploaded_file_id, EDITOR_EMAILS)
 
     time.sleep(SLEEP_BETWEEN_UPLOADS_SEC)
-
 
 if __name__ == "__main__":
     main()
