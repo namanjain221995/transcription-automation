@@ -34,7 +34,7 @@ CREDENTIALS_FILE = Path("credentials.json")
 TOKEN_FILE = Path("token.json")
 
 # SOURCE: contains slot folders (read from here)
-ROOT_2026_FOLDER_NAME = "2025"
+ROOT_SLOTS_FOLDER_NAME = "2025"  # <-- your root folder that contains Slot folders
 
 # DESTINATION: must exist anywhere in Drive. Script will NOT create it.
 OUTPUT_ROOT_FOLDER_NAME = "Candidate Result2"
@@ -45,7 +45,7 @@ GDOC_MIME = "application/vnd.google-apps.document"
 PERSON_DOC_NAME = "Deliverables Analysis"
 SLOT_DOC_NAME = "All Deliverables Analysis"
 
-# Skip folders under 2026/<Slot>/ that are NOT people folders
+# Skip folders under ROOT/<Slot>/ that are NOT people folders
 SKIP_PERSON_FOLDERS = {"1. Format"}
 
 # Give editor access to these emails (folder + doc)
@@ -54,7 +54,6 @@ EDITOR_EMAILS = [
     "sahil.patel@techsarasolutions.com",
     "soham.piprotar@techsarasolutions.com",
 ]
-
 
 # =========================
 # Auth
@@ -99,10 +98,12 @@ def get_docs_service(creds: Credentials):
     return build("docs", "v1", credentials=creds)
 
 
-def _list_kwargs() -> Dict[str, Any]:
+# =========================
+# Shared Drives kwargs (SAFE per method)
+# =========================
+def _kwargs_for_list() -> Dict[str, Any]:
     """
-    Add shared-drive flags to every Drive API call when USE_SHARED_DRIVES=True.
-    Safe to pass to create/list/delete/permissions.
+    Use ONLY for drive.files().list() calls.
     """
     if USE_SHARED_DRIVES:
         return {
@@ -113,12 +114,26 @@ def _list_kwargs() -> Dict[str, Any]:
     return {}
 
 
+def _kwargs_for_mutation() -> Dict[str, Any]:
+    """
+    Use for create/delete/permissions. Passing list-only params causes 400.
+    """
+    if USE_SHARED_DRIVES:
+        return {"supportsAllDrives": True}
+    return {}
+
+
 # =========================
 # Drive helpers
 # =========================
 def _escape_drive_q_value(s: str) -> str:
-    # Drive query string escaping: single quote is escaped by doubling it
-    return s.replace("'", "''")
+    """
+    Google Drive v3 query strings:
+    - Escape backslash as \\\\
+    - Escape single quote as \\\'
+    Doubling single quotes (SQL style) breaks Drive queries.
+    """
+    return s.replace("\\", "\\\\").replace("'", "\\'")
 
 
 def drive_search_folder_anywhere(drive, folder_name: str) -> List[dict]:
@@ -128,7 +143,7 @@ def drive_search_folder_anywhere(drive, folder_name: str) -> List[dict]:
         q=q,
         fields="files(id,name,parents,modifiedTime)",
         pageSize=200,
-        **_list_kwargs(),
+        **_kwargs_for_list(),
     ).execute()
     return res.get("files", []) or []
 
@@ -150,7 +165,7 @@ def drive_list_children(drive, parent_id: str, mime_type: Optional[str] = None):
             fields="nextPageToken, files(id,name,mimeType,modifiedTime)",
             pageSize=1000,
             pageToken=page_token,
-            **_list_kwargs(),
+            **_kwargs_for_list(),
         ).execute()
 
         for f in res.get("files", []):
@@ -172,7 +187,7 @@ def drive_find_children(drive, parent_id: str, name: str, mime_type: Optional[st
         q=q,
         fields="files(id,name,mimeType,parents,modifiedTime)",
         pageSize=200,
-        **_list_kwargs(),
+        **_kwargs_for_list(),
     ).execute()
     return res.get("files", []) or []
 
@@ -185,7 +200,7 @@ def drive_find_child(drive, parent_id: str, name: str, mime_type: Optional[str] 
 
 
 def drive_delete_file(drive, file_id: str):
-    drive.files().delete(fileId=file_id, **_list_kwargs()).execute()
+    drive.files().delete(fileId=file_id, **_kwargs_for_mutation()).execute()
 
 
 def drive_delete_all_named(drive, parent_id: str, name: str, mime_type: Optional[str] = None) -> int:
@@ -197,13 +212,13 @@ def drive_delete_all_named(drive, parent_id: str, name: str, mime_type: Optional
 
 def drive_create_folder(drive, parent_id: str, name: str) -> str:
     meta = {"name": name, "mimeType": FOLDER_MIME, "parents": [parent_id]}
-    created = drive.files().create(body=meta, fields="id", **_list_kwargs()).execute()
+    created = drive.files().create(body=meta, fields="id", **_kwargs_for_mutation()).execute()
     return created["id"]
 
 
 def drive_create_gdoc(drive, parent_id: str, name: str) -> str:
     meta = {"name": name, "mimeType": GDOC_MIME, "parents": [parent_id]}
-    created = drive.files().create(body=meta, fields="id", **_list_kwargs()).execute()
+    created = drive.files().create(body=meta, fields="id", **_kwargs_for_mutation()).execute()
     return created["id"]
 
 
@@ -223,11 +238,12 @@ def drive_grant_editor_access(drive, file_id: str, emails: List[str]):
                 fileId=file_id,
                 body=perm,
                 sendNotificationEmail=False,
-                **_list_kwargs(),
+                **_kwargs_for_mutation(),
             ).execute()
             print(f"  [PERM] Editor added: {email}")
         except HttpError as e:
             msg = (e.content or b"").decode("utf-8", errors="ignore").lower()
+            # best-effort dedupe handling
             if "alreadyexists" in msg or "already exists" in msg or "duplicate" in msg:
                 print(f"  [PERM] Already has access: {email}")
             else:
@@ -247,7 +263,7 @@ def list_slot_folders(drive, slots_parent_id: str) -> List[dict]:
 def choose_slot(drive, slots_parent_id: str) -> dict:
     slots = list_slot_folders(drive, slots_parent_id)
     if not slots:
-        raise RuntimeError("No slot folders found under 2026.")
+        raise RuntimeError(f"No slot folders found under '{ROOT_SLOTS_FOLDER_NAME}'.")
 
     if SLOT_CHOICE.isdigit():
         idx = int(SLOT_CHOICE)
@@ -411,14 +427,14 @@ def main():
     drive = get_drive_service(creds)
     docs = get_docs_service(creds)
 
-    # --- Find SOURCE 2026 folder (contains slots) ---
-    candidates_2026 = drive_search_folder_anywhere(drive, ROOT_2026_FOLDER_NAME)
-    if not candidates_2026:
-        raise RuntimeError(f"Could not find folder '{ROOT_2026_FOLDER_NAME}' anywhere in Drive.")
-    base_2026 = pick_best_named_folder(candidates_2026)
-    base_2026_id = base_2026["id"]
+    # --- Find SOURCE root folder (contains slots) ---
+    candidates_root = drive_search_folder_anywhere(drive, ROOT_SLOTS_FOLDER_NAME)
+    if not candidates_root:
+        raise RuntimeError(f"Could not find folder '{ROOT_SLOTS_FOLDER_NAME}' anywhere in Drive.")
+    base_root = pick_best_named_folder(candidates_root)
+    base_root_id = base_root["id"]
 
-    # --- Find OUTPUT ROOT folder in Drive (Candidate Result) ---
+    # --- Find OUTPUT ROOT folder in Drive ---
     candidates_out = drive_search_folder_anywhere(drive, OUTPUT_ROOT_FOLDER_NAME)
     if not candidates_out:
         raise RuntimeError(
@@ -429,11 +445,11 @@ def main():
     output_root_id = output_root["id"]
 
     # --- Choose which slot to process (AUTO if SLOT_CHOICE provided) ---
-    slot = choose_slot(drive, base_2026_id)
+    slot = choose_slot(drive, base_root_id)
     slot_name = slot["name"]
     slot_id = slot["id"]
 
-    # --- Create/Use per-slot output folder under Candidate Result ---
+    # --- Create/Use per-slot output folder under Candidate Result2 ---
     slot_output_folder = drive_find_child(drive, output_root_id, slot_name, FOLDER_MIME)
     if not slot_output_folder:
         slot_output_folder_id = drive_create_folder(drive, output_root_id, slot_name)
@@ -445,7 +461,7 @@ def main():
     print("[PERM] Setting folder editors...")
     drive_grant_editor_access(drive, slot_output_folder_id, EDITOR_EMAILS)
 
-    # --- Create slot-level doc inside Candidate Result/<SlotName>/ ---
+    # --- Create slot-level doc inside Candidate Result2/<SlotName>/ ---
     deleted = drive_delete_all_named(drive, slot_output_folder_id, SLOT_DOC_NAME, GDOC_MIME)
     if deleted:
         print(f"[OUTPUT] Deleted {deleted} existing '{SLOT_DOC_NAME}' doc(s) in {OUTPUT_ROOT_FOLDER_NAME}/{slot_name}")
@@ -462,7 +478,7 @@ def main():
         dest_doc = docs_get_document(docs, slot_doc_id)
     except HttpError as e:
         content = (e.content or b"").decode("utf-8", errors="ignore")
-        if e.resp.status == 403 and ("SERVICE_DISABLED" in content or "docs.googleapis.com" in content):
+        if e.resp.status == 403 and ("service_disabled" in content.lower() or "docs.googleapis.com" in content):
             print("\n[ERROR] Google Docs API is disabled for your Google Cloud project.")
             print("Enable it here:")
             print("https://console.developers.google.com/apis/api/docs.googleapis.com/overview")
@@ -474,7 +490,7 @@ def main():
     used_first_tab = False
     found_any = False
 
-    # --- Read people folders from SOURCE slot folder 2026/<SlotName>/ ---
+    # --- Read people folders from SOURCE slot folder ROOT/<SlotName>/ ---
     people = sorted(
         [
             f
