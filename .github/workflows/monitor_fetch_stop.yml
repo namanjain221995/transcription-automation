@@ -3,7 +3,7 @@ name: EC2 Monitor -> Stop Docker -> Stop EC2
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "*/1 * * * *"
 
 permissions:
   id-token: write
