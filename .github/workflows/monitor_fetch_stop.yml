@@ -3,11 +3,15 @@ name: EC2 Monitor -> Stop Docker -> Stop EC2
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/5 * * * *"   # every 5 minutes (GitHub schedules can delay)
+    - cron: "*/5 * * * *"
 
 permissions:
   id-token: write
   contents: read
+
+concurrency:
+  group: ec2-monitor-stop
+  cancel-in-progress: false
 
 jobs:
   monitor_stop:
@@ -49,6 +53,7 @@ jobs:
             exit 0
           fi
           echo "public_ip=$IP" >> "$GITHUB_OUTPUT"
+          echo "EC2 IP: $IP"
 
       - name: Wait for SSH (port 22)
         run: |
@@ -64,7 +69,7 @@ jobs:
           echo "SSH not reachable. Exiting safely."
           exit 0
 
-      - name: Check if container is still running (container_id.txt)
+      - name: Decide if safe to stop (ONLY stop when container finished)
         id: decide
         run: |
           set -euo pipefail
@@ -93,15 +98,14 @@ jobs:
             fi
 
             CID=\$(cat runs/\$RUN_ID/container_id.txt)
-
-            # If container is still running -> do NOT stop
             RUNNING=\$(docker inspect -f '{{.State.Running}}' \"\$CID\" 2>/dev/null || echo 'missing')
+
             if [ \"\$RUNNING\" = 'true' ]; then
               echo 'SAFE_STOP=false REASON=container_running'
               exit 0
             fi
 
-            # If container is NOT running/missing -> require exit_code.txt to exist
+            # container not running -> require exit_code marker
             if [ -f runs/\$RUN_ID/exit_code.txt ]; then
               echo 'SAFE_STOP=true REASON=container_stopped_and_exit_code_exists'
             else
@@ -110,6 +114,7 @@ jobs:
           " || true)"
 
           echo "$OUT"
+
           if echo "$OUT" | grep -q 'SAFE_STOP=true'; then
             echo "safe_stop=true" >> "$GITHUB_OUTPUT"
           else
@@ -123,6 +128,7 @@ jobs:
           exit 0
 
       - name: Stop docker compose on EC2 (cleanup)
+        if: steps.decide.outputs.safe_stop == 'true'
         uses: appleboy/ssh-action@v1.0.3
         env:
           EC2_PATH: ${{ secrets.EC2_PATH }}
@@ -145,6 +151,7 @@ jobs:
             echo "Compose cleanup done."
 
       - name: Stop EC2 instance
+        if: steps.decide.outputs.safe_stop == 'true'
         run: |
           set -euo pipefail
           INSTANCE_ID="${{ secrets.EC2_INSTANCE_ID }}"
