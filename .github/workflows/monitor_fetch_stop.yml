@@ -1,0 +1,183 @@
+name: EC2 Monitor -> Fetch Artifacts -> Stop
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/15 * * * *"   # every 15 minutes
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  monitor_fetch_stop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Get instance state
+        id: state
+        run: |
+          set -euo pipefail
+          INSTANCE_ID="${{ secrets.EC2_INSTANCE_ID }}"
+          STATE="$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
+            --query 'Reservations[0].Instances[0].State.Name' --output text)"
+          echo "state=$STATE" >> "$GITHUB_OUTPUT"
+          echo "Instance state: $STATE"
+
+      - name: Exit if instance not running
+        if: steps.state.outputs.state != 'running'
+        run: |
+          echo "Instance is not running. Nothing to fetch/stop."
+          exit 0
+
+      - name: Get EC2 Public IP
+        id: ec2ip
+        run: |
+          set -euo pipefail
+          INSTANCE_ID="${{ secrets.EC2_INSTANCE_ID }}"
+          IP="$(aws ec2 describe-instances \
+            --instance-ids "$INSTANCE_ID" \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' \
+            --output text)"
+          if [ "$IP" = "None" ] || [ -z "$IP" ]; then
+            echo "ERROR: Could not get Public IP."
+            exit 1
+          fi
+          echo "public_ip=$IP" >> "$GITHUB_OUTPUT"
+          echo "EC2 Public IP: $IP"
+
+      - name: Wait for SSH (port 22)
+        run: |
+          set -euo pipefail
+          HOST="${{ steps.ec2ip.outputs.public_ip }}"
+          echo "Waiting for SSH on $HOST:22 ..."
+          for i in {1..60}; do
+            if nc -z -w 5 "$HOST" 22; then
+              echo "SSH reachable."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "ERROR: SSH not reachable."
+          exit 1
+
+      - name: Check if run is DONE and create tarball on EC2 (if done)
+        id: make_tar
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          EC2_PATH: ${{ secrets.EC2_PATH }}
+        with:
+          host: ${{ steps.ec2ip.outputs.public_ip }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: 22
+          script_stop: true
+          command_timeout: 15m
+          envs: EC2_PATH
+          script: |
+            set -euo pipefail
+            cd "$EC2_PATH"
+
+            if [ ! -f LAST_RUN_ID ]; then
+              echo "NO LAST_RUN_ID. Not finished."
+              exit 0
+            fi
+
+            RUN_ID="$(cat LAST_RUN_ID)"
+            RUN_DIR="$EC2_PATH/runs/$RUN_ID"
+            TAR="/tmp/run_${RUN_ID}.tgz"
+
+            if [ ! -d "$RUN_DIR" ]; then
+              echo "RUN_DIR missing: $RUN_DIR"
+              exit 0
+            fi
+
+            # done condition: exit_code.txt exists
+            if [ -f "$RUN_DIR/exit_code.txt" ]; then
+              echo "DONE. Creating tarball: $TAR"
+              tar -czf "$TAR" -C "$EC2_PATH" "runs/$RUN_ID" "LAST_RUN_ID"
+              ls -la "$TAR"
+            else
+              echo "Not done yet (exit_code.txt missing)."
+            fi
+
+      - name: Determine done/not-done (fast SSH check)
+        id: donecheck
+        run: |
+          set -euo pipefail
+          HOST="${{ steps.ec2ip.outputs.public_ip }}"
+          USER="${{ secrets.EC2_USER }}"
+          KEY_FILE="$(mktemp)"
+          echo "${{ secrets.EC2_SSH_KEY }}" > "$KEY_FILE"
+          chmod 600 "$KEY_FILE"
+
+          if ssh -o StrictHostKeyChecking=no -i "$KEY_FILE" "$USER@$HOST" \
+              "cd '${{ secrets.EC2_PATH }}' && [ -f LAST_RUN_ID ] && RUN_ID=\$(cat LAST_RUN_ID) && [ -f \"runs/\$RUN_ID/exit_code.txt\" ]"; then
+            RUN_ID="$(ssh -o StrictHostKeyChecking=no -i "$KEY_FILE" "$USER@$HOST" "cd '${{ secrets.EC2_PATH }}' && cat LAST_RUN_ID")"
+            echo "done=true" >> "$GITHUB_OUTPUT"
+            echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+            echo "Run is done. RUN_ID=$RUN_ID"
+          else
+            echo "done=false" >> "$GITHUB_OUTPUT"
+            echo "Run not finished yet."
+          fi
+
+      - name: Exit if still running
+        if: steps.donecheck.outputs.done != 'true'
+        run: |
+          echo "Still running. Next schedule will check again."
+          exit 0
+
+      - name: Download tarball via SCP
+        id: download
+        if: steps.donecheck.outputs.done == 'true'
+        run: |
+          set -euo pipefail
+          HOST="${{ steps.ec2ip.outputs.public_ip }}"
+          USER="${{ secrets.EC2_USER }}"
+          RUN_ID="${{ steps.donecheck.outputs.run_id }}"
+
+          KEY_FILE="$(mktemp)"
+          echo "${{ secrets.EC2_SSH_KEY }}" > "$KEY_FILE"
+          chmod 600 "$KEY_FILE"
+
+          # Ensure tar exists (in case previous step didn't create it)
+          ssh -o StrictHostKeyChecking=no -i "$KEY_FILE" "$USER@$HOST" \
+            "cd '${{ secrets.EC2_PATH }}' && TAR=/tmp/run_${RUN_ID}.tgz && (test -f \$TAR || tar -czf \$TAR -C '${{ secrets.EC2_PATH }}' runs/${RUN_ID} LAST_RUN_ID) && ls -la \$TAR"
+
+          scp -o StrictHostKeyChecking=no -i "$KEY_FILE" \
+            "$USER@$HOST:/tmp/run_${RUN_ID}.tgz" "./run_${RUN_ID}.tgz"
+
+      - name: Upload GitHub artifact (logs/markers)
+        if: steps.donecheck.outputs.done == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ec2-run-${{ steps.donecheck.outputs.run_id }}
+          path: ./run_${{ steps.donecheck.outputs.run_id }}.tgz
+          retention-days: 30
+
+      - name: Slack alert (optional)
+        if: steps.donecheck.outputs.done == 'true' && secrets.SLACK_WEBHOOK_URL != ''
+        run: |
+          set -euo pipefail
+          RUN_ID="${{ steps.donecheck.outputs.run_id }}"
+          curl -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\"✅ EC2 run *${RUN_ID}* finished. GitHub artifact uploaded: ec2-run-${RUN_ID}\"}" \
+            "${{ secrets.SLACK_WEBHOOK_URL }}"
+
+      - name: Stop EC2 instance
+        if: steps.donecheck.outputs.done == 'true'
+        run: |
+          set -euo pipefail
+          INSTANCE_ID="${{ secrets.EC2_INSTANCE_ID }}"
+          echo "Stopping EC2..."
+          aws ec2 stop-instances --instance-ids "$INSTANCE_ID" >/dev/null || true
+          aws ec2 wait instance-stopped --instance-ids "$INSTANCE_ID"
+          echo "EC2 stopped."

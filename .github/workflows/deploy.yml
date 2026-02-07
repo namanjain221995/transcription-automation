@@ -1,4 +1,4 @@
-name: EC2 Deploy (Start -> Deploy -> Stop)
+name: EC2 Deploy (Detached)
 
 on:
   push:
@@ -13,16 +13,10 @@ concurrency:
   group: ec2-deploy-main
   cancel-in-progress: true
 
-env:
-  AWS_REGION: ${{ secrets.AWS_REGION }}
-  INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
-
 jobs:
-  start_instance:
-    name: Start Instance
+  deploy:
     runs-on: ubuntu-latest
-    outputs:
-      public_ip: ${{ steps.ec2ip.outputs.public_ip }}
+    timeout-minutes: 600
 
     steps:
       - name: Configure AWS credentials (OIDC)
@@ -34,6 +28,7 @@ jobs:
       - name: Start EC2 instance
         run: |
           set -euo pipefail
+          INSTANCE_ID="${{ secrets.EC2_INSTANCE_ID }}"
           aws ec2 start-instances --instance-ids "$INSTANCE_ID" >/dev/null
           echo "Waiting for instance to be running..."
           aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
@@ -43,6 +38,7 @@ jobs:
         id: ec2ip
         run: |
           set -euo pipefail
+          INSTANCE_ID="${{ secrets.EC2_INSTANCE_ID }}"
           IP="$(aws ec2 describe-instances \
             --instance-ids "$INSTANCE_ID" \
             --query 'Reservations[0].Instances[0].PublicIpAddress' \
@@ -54,64 +50,54 @@ jobs:
           echo "public_ip=$IP" >> "$GITHUB_OUTPUT"
           echo "EC2 Public IP: $IP"
 
-  deploy:
-    name: Deploy
-    runs-on: ubuntu-latest
-    needs: [start_instance]
-    timeout-minutes: 960
-
-    steps:
-      - name: Wait for SSH (port 22) to be ready
+      - name: Wait for SSH (port 22)
         run: |
           set -euo pipefail
-          HOST="${{ needs.start_instance.outputs.public_ip }}"
+          HOST="${{ steps.ec2ip.outputs.public_ip }}"
           echo "Waiting for SSH on $HOST:22 ..."
           for i in {1..120}; do
             if nc -z -w 5 "$HOST" 22; then
-              echo "SSH is reachable."
+              echo "SSH reachable."
               exit 0
             fi
-            echo "Still waiting ($i/120)..."
             sleep 5
           done
-          echo "ERROR: SSH not reachable after waiting."
+          echo "ERROR: SSH not reachable."
           exit 1
 
-      - name: Deploy and run on EC2 via SSH (docker compose)
+      - name: Deploy and start compose in background (detached)
         uses: appleboy/ssh-action@v1.0.3
         env:
-          EC2_PATH: ${{ secrets.EC2_PATH }}   # e.g. /home/ec2-user/transcription-automation
+          EC2_PATH: ${{ secrets.EC2_PATH }} # /home/ec2-user/transcription-automation
         with:
-          host: ${{ needs.start_instance.outputs.public_ip }}
-          username: ${{ secrets.EC2_USER }}   # e.g. ec2-user
+          host: ${{ steps.ec2ip.outputs.public_ip }}
+          username: ${{ secrets.EC2_USER }} # ec2-user
           key: ${{ secrets.EC2_SSH_KEY }}
           port: 22
           script_stop: true
-          command_timeout: 330m
+          command_timeout: 30m
           envs: EC2_PATH
           script: |
             set -euo pipefail
 
-            echo "== Server info =="
-            whoami
-            pwd
-            date
-
             echo "== Validate EC2_PATH =="
-            echo "EC2_PATH='$EC2_PATH'"
+            echo "EC2_PATH=$EC2_PATH"
             if [ -z "${EC2_PATH:-}" ]; then
-              echo "ERROR: EC2_PATH is missing/empty"
+              echo "ERROR: EC2_PATH empty"
               exit 1
             fi
             if [ ! -d "$EC2_PATH" ]; then
-              echo "ERROR: EC2_PATH does not exist on server: $EC2_PATH"
+              echo "ERROR: EC2_PATH does not exist: $EC2_PATH"
               exit 1
             fi
 
-            echo "== Go to project =="
             cd "$EC2_PATH"
+            echo "== Project dir =="
             pwd
             ls -la
+
+            echo "== Ensure runs dir =="
+            mkdir -p "$EC2_PATH/runs"
 
             echo "== Ensure git installed =="
             if ! command -v git >/dev/null 2>&1; then
@@ -140,36 +126,28 @@ jobs:
             fi
             $COMPOSE version
 
-            echo "== Run pipeline =="
-            $COMPOSE down || true
-            $COMPOSE up --build --abort-on-container-exit --exit-code-from test_runner || {
-              echo "== Compose failed, printing logs =="
-              $COMPOSE logs --no-color || true
-              exit 1
-            }
+            echo "== Create RUN_ID markers =="
+            RUN_ID="$(date +%Y%m%d_%H%M%S)"
+            RUN_DIR="$EC2_PATH/runs/$RUN_ID"
+            mkdir -p "$RUN_DIR"
+            echo "$RUN_ID" | tee "$EC2_PATH/LAST_RUN_ID"
+            echo "RUN_ID=$RUN_ID"
+            echo "RUN_DIR=$RUN_DIR"
 
-            echo "== Cleanup =="
-            $COMPOSE down || true
-            echo "== DONE =="
+            echo "== Start compose (durable detached) =="
+            # setsid + nohup + </dev/null makes it survive SSH disconnects
+            setsid nohup bash -lc "
+              set +e
+              cd '$EC2_PATH'
+              $COMPOSE down || true
+              $COMPOSE up --build --abort-on-container-exit --exit-code-from test_runner
+              EC=\$?
+              echo \$EC > '$RUN_DIR/exit_code.txt'
+              date > '$RUN_DIR/DONE'
+              $COMPOSE down || true
+              exit 0
+            " > '$RUN_DIR/run.log' 2>&1 < /dev/null &
 
-  stop_instance:
-    name: Stop Instance
-    runs-on: ubuntu-latest
-    needs: [start_instance, deploy]
-    if: always()
-
-    steps:
-      - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ secrets.AWS_REGION }}
-
-      - name: Stop EC2 instance (not terminating)
-        run: |
-          set -euo pipefail
-          echo "Stopping EC2 instance..."
-          aws ec2 stop-instances --instance-ids "$INSTANCE_ID" >/dev/null || true
-          echo "Waiting for instance to stop..."
-          aws ec2 wait instance-stopped --instance-ids "$INSTANCE_ID"
-          echo "EC2 stopped."
+            echo \$! | tee '$RUN_DIR/pid.txt'
+            echo "Detached PID=$(cat "$RUN_DIR/pid.txt")"
+            echo "Log file: $RUN_DIR/run.log"
