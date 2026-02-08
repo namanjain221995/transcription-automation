@@ -1,31 +1,27 @@
 """
-Drive-integrated Candidate Eye/Face Tracking (slot-based)
-+ Candidate-face selection via reference image (InsightFace)
-+ Flexible candidate LEFT/RIGHT view (split-screen or single)
+test6.py — Drive-integrated Candidate Eye/Face Tracking (slot-based)
+FAST BY DEFAULT (just run: python test6.py)
 
-NON-INTERACTIVE UPDATE (Option B):
-If SLOT_CHOICE is set (e.g., SLOT_CHOICE=2), script auto-picks that slot.
-If not set, it shows interactive slot menu.
-
-STRICT REF MATCH BEHAVIOR:
-If REF_SIM is '-' (no match) OR REF_SIM < ref_min_sim, treat as TRAINER:
-  - Do NOT track / do NOT compute gaze / do NOT run FaceMesh / do NOT draw mesh for that frame.
-  - Only track when matched candidate is found (REF_SIM >= ref_min_sim).
-  - If no reference image exists, fallback logic still applies (candidate_side/largest-face).
-
-Do NOT upload these to Drive:
+✅ DEFAULT BEHAVIOR (no flags needed):
+- Uploads:
+  - __EYE_result.json
+  - __EYE_annotated_h264.mp4  (annotated video ON)
+- Annotated video shows FULL FACE MESH (like your screenshot) + eye/iris dots/boxes + LOOKING/Focus label
+- STRICT_REF_ONLY=True:
+  If reference image exists and REF_SIM < ref_min_sim OR no match -> treat as TRAINER FRAME:
+    - Do NOT run FaceMesh
+    - Do NOT track gaze
+    - Do NOT draw mesh
+- Do NOT upload:
   - __EYE_summary.json
   - __EYE_metrics.csv
+- Do NOT process any input video that contains '__EYE_'
 
-Do NOT re-process generated outputs (any file containing '__EYE_').
-
-We still upload:
-  - __EYE_result.json
-  - annotated video (if enabled)
-
-Retry behavior:
-If a video fails (e.g., BrokenPipeError), retry the SAME video again (not exit)
-up to MAX_VIDEO_RETRIES (env) with backoff.
+🚀 SPEED OPTIMIZATIONS (CPU/RAM heavy):
+- ROI-first InsightFace matching (huge speed-up)
+- Periodic full-frame reacquire to recover candidate movement
+- Uses all CPU threads (OpenMP/MKL/NumExpr + OpenCV threads)
+- Downscale for processing by default (FAST_DEFAULT_DOWNSCALE), annotated output uses that resolution
 
 Install:
   pip install opencv-python mediapipe numpy pandas python-dotenv openai insightface onnxruntime
@@ -36,15 +32,26 @@ Requires:
   - token.json created on first run
   - OPENAI_API_KEY in .env
 
-Run:
-  python drive_eye_tracker.py --candidate_side auto
-  SLOT_CHOICE=2 python drive_eye_tracker.py --candidate_side right
-
-SERVER/DOCKER AUTH:
-  HEADLESS_AUTH=1 python drive_eye_tracker.py ...
+Optional ENV:
+  SLOT_CHOICE=2
+  USE_SHARED_DRIVES=1
+  HEADLESS_AUTH=1
+  OPENAI_MODEL=gpt-5
+  MAX_VIDEO_RETRIES=3
+  VIDEO_RETRY_BASE_SLEEP=5
 """
 
 import os
+
+# ==========================================================
+# MAX CPU/RAM UTILIZATION (set BEFORE numpy/onnx/insightface)
+# ==========================================================
+_CPU = os.cpu_count() or 8
+os.environ.setdefault("OMP_NUM_THREADS", str(_CPU))
+os.environ.setdefault("MKL_NUM_THREADS", str(_CPU))
+os.environ.setdefault("NUMEXPR_NUM_THREADS", str(_CPU))
+os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
+
 import io
 import re
 import json
@@ -82,21 +89,35 @@ import mediapipe as mp
 
 
 # =========================
-# ENV (Option B)
+# ENV
 # =========================
-SLOT_CHOICE = (os.getenv("SLOT_CHOICE") or "").strip()  # e.g. "2"
+SLOT_CHOICE = (os.getenv("SLOT_CHOICE") or "").strip()
 USE_SHARED_DRIVES = (os.getenv("USE_SHARED_DRIVES") or "").strip().lower() in ("1", "true", "yes", "y")
 DEFAULT_OPENAI_MODEL = (os.getenv("OPENAI_MODEL") or "").strip() or "gpt-5"
-
-# Headless auth (server/docker): prints URL, paste code in terminal
 HEADLESS_AUTH = (os.getenv("HEADLESS_AUTH") or "").strip().lower() in ("1", "true", "yes", "y")
 
+# =========================
+# FAST DEFAULTS (no flags needed)
+# =========================
+FAST_DEFAULT_MATCH_EVERY_N = int((os.getenv("FAST_MATCH_EVERY_N") or "60").strip() or 60)
+
+# Default processing resolution (annotated output uses this resolution).
+# Recommended:
+# - If your originals are 1080p → 1280x720 is a great compromise (fast + good quality).
+# - If your originals are 720p → you can set FAST_DEFAULT_DOWNSCALE="" to keep original resolution.
+FAST_DEFAULT_DOWNSCALE = (os.getenv("FAST_DOWNSCALE") or "1280x720").strip()
+
+# ROI matching tuning
+ROI_PAD = float((os.getenv("ROI_PAD") or "0.55").strip() or 0.55)
+FULL_FRAME_EVERY_K_MATCHES = int((os.getenv("FULL_FRAME_EVERY_K_MATCHES") or "6").strip() or 6)
+MAX_STALE_MULT = float((os.getenv("MAX_STALE_MULT") or "2.0").strip() or 2.0)
 
 # =========================
 # VIDEO RETRIES (per video)
 # =========================
 MAX_VIDEO_RETRIES = int((os.getenv("MAX_VIDEO_RETRIES") or "3").strip() or 3)
 VIDEO_RETRY_BASE_SLEEP = float((os.getenv("VIDEO_RETRY_BASE_SLEEP") or "5").strip() or 5.0)
+
 
 def is_retryable_video_error(e: Exception) -> bool:
     if isinstance(e, (BrokenPipeError, ConnectionError, TimeoutError)):
@@ -117,6 +138,10 @@ def is_retryable_video_error(e: Exception) -> bool:
         "502",
         "503",
         "504",
+        "moov atom not found",
+        "invalid data found",
+        "error while decoding",
+        "ffmpeg",
     ]
     return any(k in msg for k in retry_keywords)
 
@@ -129,40 +154,29 @@ CREDENTIALS_FILE = Path("credentials.json")
 TOKEN_FILE = Path("token.json")
 FOLDER_MIME = "application/vnd.google-apps.folder"
 
-ROOT_2026_FOLDER_NAME = "2025"
+ROOT_FOLDER_NAME = "2025"  # your Drive root folder name
 
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}
 
-# Which deliverable folders to process
 FOLDER_NAMES_TO_PROCESS = [
     "3. Introduction Video",
     "5. Project Scenarios",
     "8. Tools & Technology Videos",
 ]
 
-# Skip non-person folders under slot
 SKIP_PERSON_FOLDERS = {"1. Format"}
 
-# Candidate reference image auto-discovery inside each person folder
 CANDIDATE_IMAGE_NAME_RX = re.compile(
     r"(candidate|profile|photo|face|selfie|headshot).*?\.(jpg|jpeg|png)$",
     re.IGNORECASE,
 )
 
-# Output naming
 ANNOT_SUFFIX = "__EYE_annotated_h264.mp4"
 SUMMARY_SUFFIX = "__EYE_summary.json"   # local-only
 RESULT_SUFFIX = "__EYE_result.json"     # upload
 METRICS_SUFFIX = "__EYE_metrics.csv"    # local-only
 
-# IMPORTANT: do NOT upload metrics CSV or summary JSON
-UPLOAD_METRICS_CSV = False  # kept for clarity (not used)
-UPLOAD_SUMMARY_JSON = False  # kept for clarity (not used)
-
-# ✅ STRICT RULE:
-# If reference image exists:
-#   - Track ONLY when candidate match is present (REF_SIM >= ref_min_sim)
-#   - If no match (REF_SIM '-' / None) OR REF_SIM < ref_min_sim => ignore frame (trainer)
+# ✅ STRICT RULE
 STRICT_REF_ONLY = True
 
 
@@ -186,10 +200,9 @@ def execute_with_retries(request, *, max_retries: int = 8, base_sleep: float = 1
 
 
 # =========================
-# Shared Drives kwargs (SAFE per method)
+# Shared Drives kwargs
 # =========================
 def _kwargs_for_list() -> Dict[str, Any]:
-    # ONLY for files().list()
     if USE_SHARED_DRIVES:
         return {
             "supportsAllDrives": True,
@@ -198,14 +211,14 @@ def _kwargs_for_list() -> Dict[str, Any]:
         }
     return {}
 
+
 def _kwargs_for_mutation() -> Dict[str, Any]:
-    # create/update/delete/permissions
     if USE_SHARED_DRIVES:
         return {"supportsAllDrives": True}
     return {}
 
+
 def _get_media_kwargs() -> Dict[str, Any]:
-    # get_media/export_media
     if USE_SHARED_DRIVES:
         return {"supportsAllDrives": True}
     return {}
@@ -220,7 +233,6 @@ def get_drive_service():
     if TOKEN_FILE.exists():
         creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
 
-    # If token exists but scopes changed, refresh can fail → force reauth
     if creds and set(creds.scopes or []) != set(SCOPES):
         print("[AUTH] token.json scopes mismatch. Deleting token.json and re-authenticating...")
         TOKEN_FILE.unlink(missing_ok=True)
@@ -240,7 +252,6 @@ def get_drive_service():
                 raise FileNotFoundError("credentials.json not found next to this script.")
             flow = InstalledAppFlow.from_client_secrets_file(str(CREDENTIALS_FILE), SCOPES)
 
-            # Headless-safe auth
             if HEADLESS_AUTH or not os.environ.get("DISPLAY"):
                 creds = flow.run_console()
             else:
@@ -255,12 +266,6 @@ def get_drive_service():
 # Drive Helpers
 # =========================
 def _escape_drive_q_value(s: str) -> str:
-    """
-    Drive query string values:
-      - escape backslash first
-      - escape single quote as \'
-    This fixes folders like: Jahnvi' Team
-    """
     return s.replace("\\", "\\\\").replace("'", "\\'")
 
 
@@ -355,10 +360,6 @@ def drive_download_file(service, file_id: str, dest_path: Path):
 
 
 def drive_upload_file(service, parent_id: str, drive_filename: str, local_path: Path, mime_type: str):
-    """
-    Upload (create/update) file into parent folder.
-    IMPORTANT: use mutation kwargs (supportsAllDrives only), not list kwargs.
-    """
     existing = drive_find_child(service, parent_id, drive_filename, None)
     media = MediaFileUpload(str(local_path), mimetype=mime_type, resumable=True)
 
@@ -385,7 +386,7 @@ def drive_upload_file(service, parent_id: str, drive_filename: str, local_path: 
 
 
 # =========================
-# SLOT SELECTION (supports SLOT_CHOICE env)
+# SLOT SELECTION
 # =========================
 def list_slot_folders(service, slots_parent_id: str) -> List[dict]:
     return sorted(
@@ -397,9 +398,8 @@ def list_slot_folders(service, slots_parent_id: str) -> List[dict]:
 def choose_slot(service, slots_parent_id: str) -> dict:
     slots = list_slot_folders(service, slots_parent_id)
     if not slots:
-        raise RuntimeError("No slot folders found under 2026.")
+        raise RuntimeError("No slot folders found under ROOT folder.")
 
-    # AUTO slot
     if SLOT_CHOICE.isdigit():
         idx = int(SLOT_CHOICE)
         if 1 <= idx <= len(slots):
@@ -408,11 +408,9 @@ def choose_slot(service, slots_parent_id: str) -> dict:
             return chosen
         raise RuntimeError(f"SLOT_CHOICE='{SLOT_CHOICE}' out of range (1..{len(slots)}).")
 
-    # interactive fallback
     print("\n" + "=" * 80)
     print("SELECT SLOT TO PROCESS")
     print("=" * 80)
-
     for i, s in enumerate(slots, start=1):
         print(f"  {i:2}. {s['name']}")
     print("  EXIT - Exit\n")
@@ -429,7 +427,7 @@ def choose_slot(service, slots_parent_id: str) -> dict:
 
 
 # =========================
-# Utilities (tracking)
+# Utilities
 # =========================
 def dist(a: Tuple[float, float], b: Tuple[float, float]) -> float:
     return sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2)
@@ -469,7 +467,6 @@ def robust_center(samples: List[float]) -> float:
 def rotationMatrixToEulerAngles(R: np.ndarray) -> Tuple[float, float, float]:
     sy = sqrt(R[0, 0] * R[0, 0] + R[1, 0] * R[1, 0])
     singular = sy < 1e-6
-
     if not singular:
         x = np.arctan2(R[2, 1], R[2, 2])  # pitch
         y = np.arctan2(-R[2, 0], sy)      # yaw
@@ -478,7 +475,6 @@ def rotationMatrixToEulerAngles(R: np.ndarray) -> Tuple[float, float, float]:
         x = np.arctan2(-R[1, 2], R[1, 1])
         y = np.arctan2(-R[2, 0], sy)
         z = 0
-
     return (float(np.degrees(x)), float(np.degrees(y)), float(np.degrees(z)))
 
 
@@ -487,7 +483,6 @@ def rotationMatrixToEulerAngles(R: np.ndarray) -> Tuple[float, float, float]:
 # =========================
 LEFT_EYE = [33, 160, 158, 133, 153, 144]
 RIGHT_EYE = [362, 385, 387, 263, 373, 380]
-
 LEFT_IRIS = [474, 475, 476, 477]
 RIGHT_IRIS = [469, 470, 471, 472]
 
@@ -509,18 +504,15 @@ MOUTH_RIGHT = 291
 class TrackerConfig:
     ear_blink_threshold: float = 0.20
     min_blink_frames: int = 2
-
     gaze_dx_thresh: float = 0.11
     gaze_dy_thresh: float = 0.12
-
     yaw_thresh: float = 18.0
     yaw_soft: float = 10.0
-
     calib_seconds: float = 3.0
-
     smooth_window: int = 9
     min_hold_frames: int = 5
 
+    # DRAW (Mode A full mesh by default)
     draw_face_mesh: bool = True
     draw_eye_dots: bool = True
     draw_iris_dots: bool = True
@@ -530,7 +522,6 @@ class TrackerConfig:
 
     downscale_width: Optional[int] = None
     downscale_height: Optional[int] = None
-
     mirror_lr: bool = False
 
 
@@ -561,37 +552,25 @@ def compute_gaze_xy_norm(lm_xy) -> Tuple[Optional[float], Optional[float], Optio
 
 def estimate_head_pose_yaw(lm_xy, w: int, h: int) -> Optional[float]:
     image_points = np.array(
-        [
-            lm_xy(NOSE_TIP),
-            lm_xy(CHIN),
-            lm_xy(LEFT_EYE_OUTER),
-            lm_xy(RIGHT_EYE_OUTER),
-            lm_xy(MOUTH_LEFT),
-            lm_xy(MOUTH_RIGHT),
-        ],
+        [lm_xy(NOSE_TIP), lm_xy(CHIN), lm_xy(LEFT_EYE_OUTER), lm_xy(RIGHT_EYE_OUTER), lm_xy(MOUTH_LEFT), lm_xy(MOUTH_RIGHT)],
         dtype=np.float32,
     )
 
     model_points = np.array(
-        [
-            (0.0, 0.0, 0.0),
-            (0.0, -63.6, -12.5),
-            (-43.3, 32.7, -26.0),
-            (43.3, 32.7, -26.0),
-            (-28.9, -28.9, -24.1),
-            (28.9, -28.9, -24.1),
-        ],
+        [(0.0, 0.0, 0.0),
+         (0.0, -63.6, -12.5),
+         (-43.3, 32.7, -26.0),
+         (43.3, 32.7, -26.0),
+         (-28.9, -28.9, -24.1),
+         (28.9, -28.9, -24.1)],
         dtype=np.float32,
     )
 
     focal_length = w
     center = (w / 2.0, h / 2.0)
-    camera_matrix = np.array(
-        [[focal_length, 0, center[0]],
-         [0, focal_length, center[1]],
-         [0, 0, 1]],
-        dtype=np.float32
-    )
+    camera_matrix = np.array([[focal_length, 0, center[0]],
+                              [0, focal_length, center[1]],
+                              [0, 0, 1]], dtype=np.float32)
     dist_coeffs = np.zeros((4, 1), dtype=np.float32)
 
     ok, rvec, tvec = cv2.solvePnP(model_points, image_points, camera_matrix, dist_coeffs, flags=cv2.SOLVEPNP_ITERATIVE)
@@ -625,10 +604,7 @@ def classify_fused(dx: Optional[float], dy: Optional[float], yaw: Optional[float
             return "LEFT" if not cfg.mirror_lr else "RIGHT"
 
     if ax >= ay:
-        if dx > 0:
-            return "RIGHT" if not cfg.mirror_lr else "LEFT"
-        else:
-            return "LEFT" if not cfg.mirror_lr else "RIGHT"
+        return ("RIGHT" if dx > 0 else "LEFT") if not cfg.mirror_lr else ("LEFT" if dx > 0 else "RIGHT")
     else:
         return "DOWN" if dy > 0 else "UP"
 
@@ -660,7 +636,7 @@ def apply_hysteresis(current_label: str, proposed_label: str, hold_state: Dict[s
 
 
 # =========================
-# Candidate matching (InsightFace)
+# InsightFace matching (ROI-first)
 # =========================
 def init_face_app() -> FaceAnalysis:
     app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
@@ -682,12 +658,7 @@ def get_ref_embedding(face_app: FaceAnalysis, ref_img_path: Path) -> np.ndarray:
     faces = face_app.get(img)
     if not faces:
         raise RuntimeError(f"No face detected in reference image: {ref_img_path}")
-
-    faces = sorted(
-        faces,
-        key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]),
-        reverse=True,
-    )
+    faces = sorted(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]), reverse=True)
     emb = faces[0].embedding
     return emb / (np.linalg.norm(emb) + 1e-9)
 
@@ -696,17 +667,40 @@ def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / ((np.linalg.norm(a) + 1e-9) * (np.linalg.norm(b) + 1e-9)))
 
 
-def pick_candidate_face_bbox(
+def expand_bbox(b: Tuple[int, int, int, int], w: int, h: int, pad: float) -> Tuple[int, int, int, int]:
+    x1, y1, x2, y2 = b
+    bw = max(1, x2 - x1)
+    bh = max(1, y2 - y1)
+    px = int(bw * pad)
+    py = int(bh * pad)
+    nx1 = max(0, x1 - px)
+    ny1 = max(0, y1 - py)
+    nx2 = min(w - 1, x2 + px)
+    ny2 = min(h - 1, y2 + py)
+    if nx2 <= nx1 + 2 or ny2 <= ny1 + 2:
+        return b
+    return (nx1, ny1, nx2, ny2)
+
+
+def pick_candidate_face_bbox_roi(
     face_app: FaceAnalysis,
     frame_bgr: np.ndarray,
     ref_emb: Optional[np.ndarray],
     *,
     min_sim: float,
+    roi: Optional[Tuple[int, int, int, int]] = None,
 ) -> Tuple[Optional[Tuple[int, int, int, int]], Optional[float]]:
     if ref_emb is None:
         return None, None
 
-    faces = face_app.get(frame_bgr)
+    xoff = yoff = 0
+    img = frame_bgr
+    if roi is not None:
+        x1, y1, x2, y2 = roi
+        img = frame_bgr[y1:y2, x1:x2]
+        xoff, yoff = x1, y1
+
+    faces = face_app.get(img)
     if not faces:
         return None, None
 
@@ -724,7 +718,7 @@ def pick_candidate_face_bbox(
         return None, None
 
     x1, y1, x2, y2 = best.bbox.astype(int).tolist()
-    bbox = (x1, y1, x2, y2)
+    bbox = (x1 + xoff, y1 + yoff, x2 + xoff, y2 + yoff)
 
     if best_sim < min_sim:
         return None, best_sim
@@ -759,7 +753,6 @@ def pick_facemesh_face(
     if not faces:
         return None
 
-    # Preferred bbox (from ref match)
     if prefer_bbox is not None:
         bx1, by1, bx2, by2 = prefer_bbox
         bcx = (bx1 + bx2) / 2.0
@@ -774,38 +767,7 @@ def pick_facemesh_face(
                 best = f
         return best
 
-    # Fallback selection (only used when NO ref match)
-    mid = w * 0.5
-    margin = w * side_margin_pct
-
-    def faces_in_region(region: str):
-        out = []
-        for f in faces:
-            x1, y1, x2, y2, cx, cy, area = facemesh_bbox(f, w, h)
-            if region == "left" and cx < (mid - margin):
-                out.append((area, f))
-            elif region == "right" and cx > (mid + margin):
-                out.append((area, f))
-        out.sort(key=lambda t: t[0], reverse=True)
-        return out
-
-    if candidate_side == "left":
-        left = faces_in_region("left")
-        if left:
-            return left[0][1]
-    elif candidate_side == "right":
-        right = faces_in_region("right")
-        if right:
-            return right[0][1]
-    else:  # auto
-        left = faces_in_region("left")
-        if left:
-            return left[0][1]
-        right = faces_in_region("right")
-        if right:
-            return right[0][1]
-
-    # fallback: largest face
+    # fallback (no ref image): pick biggest face
     scored = []
     for f in faces:
         x1, y1, x2, y2, cx, cy, area = facemesh_bbox(f, w, h)
@@ -815,7 +777,7 @@ def pick_facemesh_face(
 
 
 # =========================
-# Tracking + Annotate (single video)
+# Metrics + OpenAI rating
 # =========================
 def compute_blinks(df: pd.DataFrame, cfg: TrackerConfig) -> int:
     ear = pd.to_numeric(df["ear"], errors="coerce").to_numpy(dtype=np.float32)
@@ -871,16 +833,6 @@ def summarize_metrics(df: pd.DataFrame, fps: float, cfg: TrackerConfig) -> Dict[
     )
     yaw_abs_mean = float(np.mean(np.abs(yaw_vals))) if len(yaw_vals) else None
 
-    notes = []
-    if face_detected_pct < 90:
-        notes.append("Face tracking unstable (<90% frames).")
-    if focus_on_camera_pct < 55:
-        notes.append("Low on-camera focus (<55%).")
-    if blink_rate < 6:
-        notes.append("Low blink rate (<6/min).")
-    if blink_rate > 30:
-        notes.append("High blink rate (>30/min).")
-
     return {
         "duration_sec": round(duration_sec, 2),
         "face_detected_pct": round(face_detected_pct, 2),
@@ -892,19 +844,7 @@ def summarize_metrics(df: pd.DataFrame, fps: float, cfg: TrackerConfig) -> Dict[
         "look_up_pct": round(look_up_pct, 2),
         "look_down_pct": round(look_down_pct, 2),
         "yaw_abs_mean_deg": None if yaw_abs_mean is None else round(yaw_abs_mean, 3),
-        "thresholds": {
-            "ear_blink_threshold": cfg.ear_blink_threshold,
-            "min_blink_frames": cfg.min_blink_frames,
-            "gaze_dx_thresh": cfg.gaze_dx_thresh,
-            "gaze_dy_thresh": cfg.gaze_dy_thresh,
-            "yaw_thresh": cfg.yaw_thresh,
-            "yaw_soft": cfg.yaw_soft,
-            "calib_seconds": cfg.calib_seconds,
-            "smooth_window": cfg.smooth_window,
-            "min_hold_frames": cfg.min_hold_frames,
-            "mirror_lr": cfg.mirror_lr,
-        },
-        "notes": " | ".join(notes) if notes else "OK",
+        "notes": "OK",
     }
 
 
@@ -955,7 +895,6 @@ def rate_with_openai(summary_payload: Dict[str, Any], model: str = DEFAULT_OPENA
         },
     }
 
-    # Responses API (newer) then fallback
     try:
         resp = client.responses.create(
             model=model,
@@ -980,6 +919,9 @@ def rate_with_openai(summary_payload: Dict[str, Any], model: str = DEFAULT_OPENA
         return parse_json_strict(text)
 
 
+# =========================
+# ffmpeg helpers
+# =========================
 def ensure_ffmpeg():
     try:
         subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
@@ -991,22 +933,14 @@ def transcode_to_h264_faststart(src_mp4: Path, dst_mp4: Path):
     cmd = [
         "ffmpeg",
         "-y",
-        "-i",
-        str(src_mp4),
-        "-c:v",
-        "libx264",
-        "-pix_fmt",
-        "yuv420p",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "23",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
-        "-movflags",
-        "+faststart",
+        "-i", str(src_mp4),
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-preset", "veryfast",
+        "-crf", "23",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-movflags", "+faststart",
         str(dst_mp4),
     ]
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -1018,25 +952,39 @@ def sanitize_filename(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("_") or "file"
 
 
-# =========================
-# Only treat ORIGINAL videos as inputs
-# =========================
 def is_video_file(name: str) -> bool:
     p = Path(name)
     n = p.name.lower()
-
     if p.suffix.lower() not in VIDEO_EXTS:
         return False
     if n.startswith("."):
         return False
-
-    # don't process our own generated outputs
     if "__eye_" in n:
         return False
-
     return True
 
 
+# =========================
+# Candidate image discovery
+# =========================
+def find_candidate_image_in_person_folder(service, person_folder_id: str) -> Optional[dict]:
+    files = list(drive_list_children(service, person_folder_id, None))
+    imgs = []
+    for f in files:
+        if f.get("mimeType") == FOLDER_MIME:
+            continue
+        name = f.get("name") or ""
+        if CANDIDATE_IMAGE_NAME_RX.search(name):
+            imgs.append(f)
+    if not imgs:
+        return None
+    imgs.sort(key=lambda x: (x.get("modifiedTime") or ""), reverse=True)
+    return imgs[0]
+
+
+# =========================
+# MAIN tracking function
+# =========================
 def track_one_video(
     video_path: Path,
     out_csv: Path,
@@ -1052,9 +1000,8 @@ def track_one_video(
     ref_min_sim: float,
     openai_model: str = DEFAULT_OPENAI_MODEL,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-
     if STRICT_REF_ONLY and ref_emb is not None and match_every_n == 0:
-        raise RuntimeError("STRICT_REF_ONLY requires --match_every_n > 0 (ref matching cannot be disabled).")
+        raise RuntimeError("STRICT_REF_ONLY requires match_every_n > 0 (ref matching cannot be disabled).")
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -1081,7 +1028,8 @@ def track_one_video(
     writer = None
 
     last_good_match_frame: Optional[int] = None
-    MAX_STALE_FRAMES = max(1, match_every_n * 3)
+    MAX_STALE_FRAMES = max(1, int(match_every_n * max(0.5, MAX_STALE_MULT)))
+    match_count = 0
 
     with mp.solutions.face_mesh.FaceMesh(
         static_image_mode=False,
@@ -1103,11 +1051,7 @@ def track_one_video(
                 break
 
             if cfg.downscale_width and cfg.downscale_height:
-                frame = cv2.resize(
-                    frame,
-                    (int(cfg.downscale_width), int(cfg.downscale_height)),
-                    interpolation=cv2.INTER_AREA,
-                )
+                frame = cv2.resize(frame, (int(cfg.downscale_width), int(cfg.downscale_height)), interpolation=cv2.INTER_AREA)
 
             h, w = frame.shape[:2]
 
@@ -1117,9 +1061,21 @@ def track_one_video(
 
             t = frame_idx / fps
 
-            # Ref match
+            # ---------- Ref match (ROI-first) ----------
             if ref_emb is not None and match_every_n > 0 and (frame_idx % match_every_n == 0):
-                bbox, sim = pick_candidate_face_bbox(face_app, frame, ref_emb, min_sim=ref_min_sim)
+                match_count += 1
+
+                roi = None
+                if cached_bbox is not None:
+                    roi = expand_bbox(cached_bbox, w, h, pad=ROI_PAD)
+
+                # ROI attempt
+                bbox, sim = pick_candidate_face_bbox_roi(face_app, frame, ref_emb, min_sim=ref_min_sim, roi=roi)
+
+                # periodic full-frame reacquire
+                if bbox is None and (match_count % max(1, FULL_FRAME_EVERY_K_MATCHES) == 0):
+                    bbox, sim = pick_candidate_face_bbox_roi(face_app, frame, ref_emb, min_sim=ref_min_sim, roi=None)
+
                 cached_bbox = bbox
                 cached_sim = sim
                 if bbox is not None:
@@ -1132,7 +1088,7 @@ def track_one_video(
                     cached_sim = None
                     last_good_match_frame = None
 
-            # STRICT: treat trainer if no accepted match
+            # STRICT trainer frame check
             force_no_face_this_frame = False
             if STRICT_REF_ONLY and ref_emb is not None:
                 if (cached_bbox is None) or (cached_sim is None) or (cached_sim < ref_min_sim):
@@ -1145,11 +1101,10 @@ def track_one_video(
             mouth_open = None
             yaw_deg = None
             raw = "UNKNOWN"
-
             lc = rc = None
             le_box = re_box = None
 
-            # Do NOT run FaceMesh at all on trainer frames
+            # Do NOT run FaceMesh for trainer frames
             res = None
             if not force_no_face_this_frame:
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -1157,17 +1112,13 @@ def track_one_video(
 
             if res and res.multi_face_landmarks:
                 face_lms = pick_facemesh_face(
-                    res.multi_face_landmarks,
-                    w,
-                    h,
-                    cached_bbox,
-                    candidate_side=candidate_side,
-                    side_margin_pct=side_margin_pct,
+                    res.multi_face_landmarks, w, h, cached_bbox,
+                    candidate_side=candidate_side, side_margin_pct=side_margin_pct
                 )
-
                 if face_lms is not None:
                     has_face = True
 
+                    # Draw mesh (Mode A)
                     if cfg.draw_face_mesh and writer is not None:
                         mp_drawing.draw_landmarks(
                             image=frame,
@@ -1196,6 +1147,7 @@ def track_one_video(
                     gaze_x, gaze_y, lc, rc = compute_gaze_xy_norm(lm_xy)
                     yaw_deg = estimate_head_pose_yaw(lm_xy, w, h)
 
+                    # Eye boxes
                     le_outer = np.array(lm_xy(LE_OUTER), dtype=np.float32)
                     le_inner = np.array(lm_xy(LE_INNER), dtype=np.float32)
                     le_top = np.array(lm_xy(LE_TOP), dtype=np.float32)
@@ -1215,7 +1167,6 @@ def track_one_video(
                     if center_x is None and frame_idx >= calib_frames_needed:
                         center_x = robust_center(calib_x)
                         center_y = robust_center(calib_y)
-
                     if center_x is None:
                         center_x = 0.5
                         center_y = 0.5
@@ -1226,15 +1177,14 @@ def track_one_video(
                         gaze_dy = float(gaze_y - center_y)
                         raw = classify_fused(gaze_dx, gaze_dy, yaw_deg, cfg)
 
+                    # Draw eye dots/iris/boxes
                     if writer is not None:
                         if cfg.draw_eye_dots:
                             for p in left_eye_pts + right_eye_pts:
                                 cv2.circle(frame, (int(p[0]), int(p[1])), 2, (0, 255, 0), -1)
-
                         if cfg.draw_iris_dots and lc is not None and rc is not None:
                             cv2.circle(frame, (int(lc[0]), int(lc[1])), 4, (0, 0, 255), -1)
                             cv2.circle(frame, (int(rc[0]), int(rc[1])), 4, (0, 0, 255), -1)
-
                         if cfg.draw_eye_boxes and le_box is not None and re_box is not None:
                             le_outer, le_inner, le_top, le_bottom = le_box
                             re_inner, re_outer, re_top, re_bottom = re_box
@@ -1245,18 +1195,14 @@ def track_one_video(
                             cv2.rectangle(frame, le_min, le_max, (255, 255, 0), 1)
                             cv2.rectangle(frame, re_min, re_max, (255, 255, 0), 1)
 
+                    # Mouth open
                     upper = np.array(lm_xy(UPPER_LIP), dtype=np.float32)
                     lower = np.array(lm_xy(LOWER_LIP), dtype=np.float32)
                     mouth_gap = float(np.linalg.norm(upper - lower))
-                    eye_span = float(
-                        np.linalg.norm(
-                            np.array(lm_xy(LEFT_EYE_OUTER), dtype=np.float32)
-                            - np.array(lm_xy(RIGHT_EYE_OUTER), dtype=np.float32)
-                        )
-                    )
+                    eye_span = float(np.linalg.norm(np.array(lm_xy(LEFT_EYE_OUTER), dtype=np.float32) - np.array(lm_xy(RIGHT_EYE_OUTER), dtype=np.float32)))
                     mouth_open = float(mouth_gap / (eye_span + 1e-6))
 
-            # If trainer frame, do NOT update smoothing history/hysteresis
+            # smoothing only if not trainer frame
             if not force_no_face_this_frame:
                 hist.append(raw)
                 proposed = majority_vote(hist)
@@ -1270,6 +1216,7 @@ def track_one_video(
                     if stable_label == "CENTER":
                         stable_center_count += 1
 
+            # draw labels
             if writer is not None:
                 if force_no_face_this_frame and (ref_emb is not None):
                     put_text_with_bg(frame, "TRAINER FRAME (ref mismatch)", (10, 40), font_scale=1.0, thickness=2)
@@ -1288,22 +1235,29 @@ def track_one_video(
 
                 writer.write(frame)
 
-            rows.append(
-                {
-                    "frame": frame_idx,
-                    "time_sec": t,
-                    "has_face": int(has_face),
-                    "ear": ear,
-                    "gaze_x_norm": gaze_x,
-                    "gaze_y_norm": gaze_y,
-                    "yaw_deg": yaw_deg,
-                    "gaze_dir_raw": raw,
-                    "gaze_dir": stable_label,
-                    "mouth_open_norm": mouth_open,
-                    "ref_sim": None if cached_sim is None else float(cached_sim),
-                    "ref_matched": int((cached_bbox is not None) if (ref_emb is not None) else 0),
-                }
-            )
+            # ✅ trainer frames should not inherit stable label in CSV
+            row_raw = raw
+            row_stable = stable_label
+            if force_no_face_this_frame and (ref_emb is not None):
+                row_raw = "UNKNOWN"
+                row_stable = "UNKNOWN"
+
+            accepted_match = (ref_emb is not None) and (cached_sim is not None) and (cached_sim >= ref_min_sim) and (cached_bbox is not None)
+
+            rows.append({
+                "frame": frame_idx,
+                "time_sec": t,
+                "has_face": int(has_face),
+                "ear": ear,
+                "gaze_x_norm": gaze_x,
+                "gaze_y_norm": gaze_y,
+                "yaw_deg": yaw_deg,
+                "gaze_dir_raw": row_raw,
+                "gaze_dir": row_stable,
+                "mouth_open_norm": mouth_open,
+                "ref_sim": None if cached_sim is None else float(cached_sim),
+                "ref_matched": int(accepted_match),
+            })
 
             frame_idx += 1
 
@@ -1325,69 +1279,54 @@ def track_one_video(
         "total_frames_reported": int(len(df)),
         "total_frames_metadata": int(total_frames_meta),
         "duration_sec": float((len(df) / fps) if len(df) else 0.0),
-        "candidate_side": candidate_side,
-        "side_margin_pct": side_margin_pct,
-        "ref_min_sim": ref_min_sim,
-        "match_every_n": match_every_n,
+        "ref_min_sim": float(ref_min_sim),
+        "match_every_n": int(match_every_n),
         "strict_ref_only": bool(STRICT_REF_ONLY),
         "has_reference_image": bool(ref_emb is not None),
+        "roi_pad": float(ROI_PAD),
+        "full_frame_every_k_matches": int(FULL_FRAME_EVERY_K_MATCHES),
+        "max_stale_frames": int(MAX_STALE_FRAMES),
+        "downscale": f"{cfg.downscale_width}x{cfg.downscale_height}" if (cfg.downscale_width and cfg.downscale_height) else "",
     }
 
     summary = summarize_metrics(df, float(fps), cfg)
     summary_full = {"video_meta": meta, "summary": summary}
-
     result = rate_with_openai(summary_full, model=openai_model)
     return summary_full, result
 
 
 # =========================
-# Candidate image discovery per person folder
+# CLI (kept minimal; defaults already FAST)
 # =========================
-def find_candidate_image_in_person_folder(service, person_folder_id: str) -> Optional[dict]:
-    files = list(drive_list_children(service, person_folder_id, None))
-    imgs = []
-    for f in files:
-        if f.get("mimeType") == FOLDER_MIME:
-            continue
-        name = f.get("name") or ""
-        if CANDIDATE_IMAGE_NAME_RX.search(name):
-            imgs.append(f)
-    if not imgs:
-        return None
-    imgs.sort(key=lambda x: (x.get("modifiedTime") or ""), reverse=True)
-    return imgs[0]
-
-
 def parse_args():
-    p = argparse.ArgumentParser(description="Drive slot-based eye/face tracker with ref-face matching (left/right flexible).")
-    p.add_argument("--candidate_side", choices=["auto", "left", "right"], default="auto",
-                   help="Fallback preference when ref image missing/weak. auto tries left then right then largest.")
-    p.add_argument("--side_margin_pct", type=float, default=0.06,
-                   help="Region margin around center split. e.g., 0.06 means 6%% of width.")
-    p.add_argument("--ref_min_sim", type=float, default=0.30,
-                   help="Minimum cosine similarity to accept ref match for a frame (InsightFace).")
-    p.add_argument("--match_every_n", type=int, default=10,
-                   help="Run InsightFace match every N frames (speed vs stability). 0 disables.")
-    p.add_argument("--no_annot", action="store_true", help="Disable annotated video writing + upload.")
-    p.add_argument("--no_mesh", action="store_true", help="Disable drawing face mesh (faster).")
-    p.add_argument("--downscale", type=str, default="",
-                   help="Downscale WxH, e.g. 960x540. Empty disables.")
-    p.add_argument("--mirror_lr", action="store_true",
-                   help="Mirror left/right interpretation in gaze classification (if camera is mirrored).")
+    p = argparse.ArgumentParser(description="FAST default: python test6.py")
+    p.add_argument("--candidate_side", choices=["auto", "left", "right"], default="auto")
+    p.add_argument("--side_margin_pct", type=float, default=0.06)
+    p.add_argument("--ref_min_sim", type=float, default=0.30)
+    p.add_argument("--match_every_n", type=int, default=FAST_DEFAULT_MATCH_EVERY_N)
+    p.add_argument("--downscale", type=str, default=FAST_DEFAULT_DOWNSCALE,
+                   help="Processing resolution. Annotated output uses this resolution. Default: 1280x720 (can set env FAST_DOWNSCALE).")
+    p.add_argument("--mirror_lr", action="store_true")
     return p.parse_args()
 
 
 def main():
-    args = parse_args()
     ensure_ffmpeg()
 
+    # Use all CPU threads in OpenCV
+    try:
+        cv2.setNumThreads(_CPU)
+    except Exception:
+        pass
+
+    args = parse_args()
     service = get_drive_service()
 
-    candidates_2026 = drive_search_folder_anywhere(service, ROOT_2026_FOLDER_NAME)
-    if not candidates_2026:
-        raise RuntimeError(f"Could not find folder '{ROOT_2026_FOLDER_NAME}' anywhere in Drive.")
-    base_2026 = pick_best_named_folder(candidates_2026)
-    slots_parent_id = base_2026["id"]
+    candidates_root = drive_search_folder_anywhere(service, ROOT_FOLDER_NAME)
+    if not candidates_root:
+        raise RuntimeError(f"Could not find folder '{ROOT_FOLDER_NAME}' anywhere in Drive.")
+    base_root = pick_best_named_folder(candidates_root)
+    slots_parent_id = base_root["id"]
 
     slot = choose_slot(service, slots_parent_id)
     slot_name = slot["name"]
@@ -1395,14 +1334,16 @@ def main():
 
     face_app = init_face_app()
 
+    # Parse downscale default
     down_w = down_h = None
     if args.downscale.strip():
         m = re.match(r"^\s*(\d+)\s*[xX]\s*(\d+)\s*$", args.downscale.strip())
         if not m:
-            raise RuntimeError("--downscale must be like 960x540")
+            raise RuntimeError("--downscale must be like 1280x720")
         down_w, down_h = int(m.group(1)), int(m.group(2))
 
     cfg = TrackerConfig(
+        # thresholds
         ear_blink_threshold=0.20,
         min_blink_frames=2,
         gaze_dx_thresh=0.11,
@@ -1412,31 +1353,33 @@ def main():
         calib_seconds=3.0,
         smooth_window=9,
         min_hold_frames=5,
-        draw_face_mesh=not args.no_mesh,
+
+        # ✅ Mode A: FULL MESH + dots/boxes (like screenshot)
+        draw_face_mesh=True,
         draw_eye_dots=True,
         draw_iris_dots=True,
         draw_eye_boxes=True,
-        write_annotated_video=not args.no_annot,
+
+        # ✅ annotated ON always
+        write_annotated_video=True,
+
         downscale_width=down_w,
         downscale_height=down_h,
         mirror_lr=bool(args.mirror_lr),
     )
 
     people = sorted(
-        [
-            f for f in drive_list_children(service, slot_id, FOLDER_MIME)
-            if (f.get("name") or "").strip() not in SKIP_PERSON_FOLDERS
-        ],
+        [f for f in drive_list_children(service, slot_id, FOLDER_MIME) if (f.get("name") or "").strip() not in SKIP_PERSON_FOLDERS],
         key=lambda x: (x.get("name") or "").lower(),
     )
 
     print("\n" + "=" * 100)
-    print(f"RUN SLOT: {slot_name}")
-    print("People:", len(people))
-    print(f"candidate_side={args.candidate_side}  ref_min_sim={args.ref_min_sim}  match_every_n={args.match_every_n}")
+    print(f"RUN ROOT: {base_root['name']}   SLOT: {slot_name}")
+    print(f"People: {len(people)}")
+    print(f"FAST DEFAULTS -> match_every_n={args.match_every_n}  downscale='{args.downscale}'  annotated=ON  mesh=ON")
     print(f"STRICT_REF_ONLY={STRICT_REF_ONLY} (if ref exists, ignore frames unless REF_SIM >= ref_min_sim)")
-    print("UPLOADS: result.json (+ annotated video if enabled). NOT uploading summary.json or metrics.csv.")
-    print("FIX: Will NOT treat any '__EYE_' files as input videos.")
+    print("UPLOADS: result.json + annotated video. NOT uploading summary.json or metrics.csv.")
+    print(f"ROI: ROI_PAD={ROI_PAD} FULL_FRAME_EVERY_K_MATCHES={FULL_FRAME_EVERY_K_MATCHES} MAX_STALE_MULT={MAX_STALE_MULT}")
     print(f"VIDEO RETRIES: MAX_VIDEO_RETRIES={MAX_VIDEO_RETRIES} base_sleep={VIDEO_RETRY_BASE_SLEEP}s")
     if SLOT_CHOICE:
         print(f"AUTO SLOT_CHOICE={SLOT_CHOICE}")
@@ -1469,7 +1412,7 @@ def main():
                     print(f"  [WARN] Candidate image exists but failed to use it: {e}")
                     ref_emb = None
             else:
-                print("  [WARN] No candidate image found. Fallback will use candidate_side + largest-face logic.")
+                print("  [WARN] No candidate image found. Fallback will use largest-face logic.")
 
             for deliverable_name in FOLDER_NAMES_TO_PROCESS:
                 deliverable_folder = drive_find_child(service, person_id, deliverable_name, FOLDER_MIME)
@@ -1479,12 +1422,8 @@ def main():
                 deliverable_id = deliverable_folder["id"]
                 files = list(drive_list_children(service, deliverable_id, None))
 
-                videos = [
-                    f for f in files
-                    if f.get("mimeType") != FOLDER_MIME and is_video_file(f.get("name") or "")
-                ]
+                videos = [f for f in files if f.get("mimeType") != FOLDER_MIME and is_video_file(f.get("name") or "")]
                 videos.sort(key=lambda x: (x.get("name") or "").lower())
-
                 if not videos:
                     continue
 
@@ -1500,7 +1439,7 @@ def main():
                     out_result_name = f"{stem}{RESULT_SUFFIX}"
                     out_metrics_name = f"{stem}{METRICS_SUFFIX}"   # local-only
 
-                    # Skip if already processed (result is the marker)
+                    # Skip if already processed (result is marker)
                     existing_result = drive_find_child(service, deliverable_id, out_result_name, None)
                     if existing_result:
                         print(f"    [SKIP] {vname} -> already has {out_result_name}")
@@ -1510,7 +1449,6 @@ def main():
 
                     with tempfile.TemporaryDirectory() as td:
                         td = Path(td)
-
                         local_video = td / safe_vname
                         local_csv = td / out_metrics_name
                         local_tmp_annot = td / (stem + "__tmp.mp4")
@@ -1522,6 +1460,14 @@ def main():
                         while attempt < MAX_VIDEO_RETRIES:
                             attempt += 1
                             try:
+                                # clean remnants
+                                for p in [local_video, local_csv, local_tmp_annot, local_annot_h264, local_summary, local_result]:
+                                    try:
+                                        if p.exists():
+                                            p.unlink()
+                                    except Exception:
+                                        pass
+
                                 print("      [DL  ] downloading video")
                                 drive_download_file(service, v["id"], local_video)
 
@@ -1540,13 +1486,12 @@ def main():
                                     openai_model=DEFAULT_OPENAI_MODEL,
                                 )
 
-                                # Write locally (temp). DO NOT upload summary/metrics.
+                                # Write locally (DO NOT upload summary/metrics)
                                 local_summary.write_text(json.dumps(summary_full, indent=2), encoding="utf-8")
                                 local_result.write_text(json.dumps(result, indent=2), encoding="utf-8")
 
-                                if cfg.write_annotated_video:
-                                    print("      [UP  ] uploading annotated video (H.264)")
-                                    drive_upload_file(service, deliverable_id, out_annot_name, local_annot_h264, "video/mp4")
+                                print("      [UP  ] uploading annotated video (H.264)")
+                                drive_upload_file(service, deliverable_id, out_annot_name, local_annot_h264, "video/mp4")
 
                                 print("      [UP  ] uploading result.json")
                                 drive_upload_file(service, deliverable_id, out_result_name, local_result, "application/json")
